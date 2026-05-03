@@ -1,0 +1,61 @@
+# ==========================================
+# Environments & Secrets (CRITICAL)
+# ==========================================
+.env
+.env.*
+!.env.example
+*.pem
+email_agent/credentials.json
+email_agent/credentials-web.json
+email_agent/token.json
+travel_planner_agent/.env
+email_agent/.env
+
+# ==========================================
+# Python Standard Ignores
+# ==========================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# ==========================================
+# Package Management (uv, pip, venv)
+# ==========================================
+.venv/
+venv/
+env/
+ENV/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# ==========================================
+# ADK & Agent-Specific Output
+# ==========================================
+# Ignore locally saved artifacts from RunConfig (input/output blobs)
+artifacts/
+adk_artifacts/
+output/
+downloads/
+
+# Local databases (e.g., if using local SQLite for long-term agent memory)
+*.sqlite3
+*.db
+
+# Log files and traces generated during agent execution
+*.log
+trace.json
+
+# ==========================================
+# Testing & IDEs
+# ==========================================
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+.vscode/
+.idea/
+.DS_Store
