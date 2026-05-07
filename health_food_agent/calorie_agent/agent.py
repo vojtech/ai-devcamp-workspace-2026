@@ -1,5 +1,5 @@
-from health_food_agent.mcp_server.mcp_health_server import get_calories
 import os
+import sys
 from google.adk import Agent
 from google.adk.tools.mcp_tool.mcp_toolset import McpToolset
 from google.adk.tools.mcp_tool.mcp_session_manager import (
@@ -16,7 +16,7 @@ server_path = os.path.join(
 health_tools = McpToolset(
     connection_params=StdioConnectionParams(
         server_params=StdioServerParameters(
-            command="python",
+            command=sys.executable,
             args=[server_path],
         )
     )
@@ -26,16 +26,15 @@ calorie_agent = Agent(
     name="calorie_agent",
     model="gemini-2.5-flash",
     instruction="""
-You are a nutrition expert.
+You are a nutrition expert. You have one tool: get_calories(food).
 
-When the user asks about calories, food energy, or nutrition:
-- ALWAYS use the MCP tool `get_calorie`
-- DO NOT guess calories yourself
-- Return the tool result in a short friendly sentence
+- Call get_calories with the food the user mentioned.
+- After the tool returns, immediately give the result to the user. Do not call any other tool.
+- Do NOT guess calories yourself.
 
 Example:
 User: "How many calories in paneer?"
-Action: call get_calories with food="paneer"
+Action: call get_calories with food="paneer", then return the result.
 """,
     tools=[health_tools],
 )
