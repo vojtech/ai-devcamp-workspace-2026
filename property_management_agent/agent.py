@@ -43,23 +43,32 @@ SCOPES = [
 
 
 def _load_access_token() -> str:
+    """Return a valid OAuth access token, refreshing if needed.
+    Returns empty string if token.json is missing so the module can still
+    import cleanly — Gmail MCP calls will fail at runtime with an auth error."""
     if not os.path.exists(TOKEN_PATH):
-        raise FileNotFoundError(
-            f"token.json not found at {TOKEN_PATH}\n"
-            "Run first:  python property_management_agent/login.py"
+        logger.warning(
+            "token.json not found. Gmail tools will not work until you authenticate.\n"
+            "Run:  python3.11 property_management_agent/login.py"
         )
-    creds = Credentials.from_authorized_user_file(TOKEN_PATH, SCOPES)
-    if not creds.valid:
-        if creds.expired and creds.refresh_token:
-            logger.info("Refreshing Gmail OAuth token...")
-            creds.refresh(Request())
-            with open(TOKEN_PATH, "w") as f:
-                f.write(creds.to_json())
-        else:
-            raise RuntimeError(
-                "Gmail token invalid. Run: python property_management_agent/login.py"
-            )
-    return creds.token
+        return ""
+    try:
+        creds = Credentials.from_authorized_user_file(TOKEN_PATH, SCOPES)
+        if not creds.valid:
+            if creds.expired and creds.refresh_token:
+                logger.info("Refreshing Gmail OAuth token...")
+                creds.refresh(Request())
+                with open(TOKEN_PATH, "w") as f:
+                    f.write(creds.to_json())
+            else:
+                logger.warning(
+                    "Gmail token invalid. Run:  python3.11 property_management_agent/login.py"
+                )
+                return ""
+        return creds.token
+    except Exception as e:
+        logger.warning(f"Could not load Gmail token: {e}")
+        return ""
 
 
 # ── Gmail MCP toolset (official Google server) ─────────────────────────────────
