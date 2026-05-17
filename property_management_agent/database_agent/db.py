@@ -112,22 +112,119 @@ def init_db() -> None:
         """)
 
 
+# ── Role merging ───────────────────────────────────────────────────────────────
+# Same person can be seen in different emails with different roles. We store
+# all their roles as a single comma-separated string, deduplicated case-
+# insensitively while preserving original casing for display.
+
+def _merge_roles(existing: str, new: str) -> str:
+    """Merge two role strings into a deduplicated comma-separated list.
+
+    "Owner" + "Owner/Committee Member" → "Owner, Owner/Committee Member"
+    "Tenant, Client" + "owner" → "Tenant, Client, owner"  (case-insensitive dedupe)
+    "" + "Owner" → "Owner"
+    """
+    def _split(s: str) -> list[str]:
+        return [p.strip() for p in (s or "").split(",") if p.strip()]
+
+    seen: dict[str, str] = {}  # lowercase → original casing (first seen wins)
+    for role in _split(existing) + _split(new):
+        key = role.lower()
+        if key not in seen:
+            seen[key] = role
+    return ", ".join(seen.values())
+
+
+def _consolidate_duplicates() -> None:
+    """One-shot consolidation pass: merge duplicate user rows that already
+    exist in the DB. Idempotent — safe to run on every init.
+
+    Dedupe keys:
+      employees       — LOWER(email)
+      key_contacts    — LOWER(email) when email present; else LOWER(name)
+    Roles are merged via _merge_roles.
+    property_managers and tasks/meetings are left alone (different semantics).
+    """
+    with get_conn() as conn:
+        # ── employees: dedupe by LOWER(email) ──────────────────────────────────
+        rows = conn.execute(
+            "SELECT id, name, email, role FROM employees WHERE email != '' ORDER BY id"
+        ).fetchall()
+        groups: dict[str, list] = {}
+        for r in rows:
+            groups.setdefault(r["email"].lower(), []).append(r)
+        for _, group in groups.items():
+            if len(group) <= 1:
+                continue
+            keeper = group[0]
+            merged = keeper["role"] or ""
+            for dup in group[1:]:
+                merged = _merge_roles(merged, dup["role"] or "")
+                conn.execute("DELETE FROM employees WHERE id=?", (dup["id"],))
+            conn.execute("UPDATE employees SET role=? WHERE id=?", (merged, keeper["id"]))
+
+        # ── key_contacts: dedupe by LOWER(email) (or LOWER(name) if no email) ──
+        rows = conn.execute(
+            "SELECT id, name, email, phone, role, company, notes FROM key_contacts ORDER BY id"
+        ).fetchall()
+        groups = {}
+        for r in rows:
+            key = (r["email"] or "").lower().strip()
+            if not key:
+                key = "name::" + (r["name"] or "").lower().strip()
+            if not key or key == "name::":
+                continue
+            groups.setdefault(key, []).append(r)
+        for _, group in groups.items():
+            if len(group) <= 1:
+                continue
+            keeper = group[0]
+            merged_role = keeper["role"] or ""
+            merged_phone = keeper["phone"] or ""
+            merged_company = keeper["company"] or ""
+            merged_notes = keeper["notes"] or ""
+            for dup in group[1:]:
+                merged_role = _merge_roles(merged_role, dup["role"] or "")
+                merged_phone = merged_phone or (dup["phone"] or "")
+                merged_company = merged_company or (dup["company"] or "")
+                if dup["notes"] and dup["notes"] not in merged_notes:
+                    merged_notes = (merged_notes + "; " + dup["notes"]).strip("; ")
+                conn.execute("DELETE FROM key_contacts WHERE id=?", (dup["id"],))
+            conn.execute("""
+                UPDATE key_contacts
+                SET role=?, phone=?, company=?, notes=?
+                WHERE id=?
+            """, (merged_role, merged_phone, merged_company, merged_notes, keeper["id"]))
+
+
 init_db()
+_consolidate_duplicates()
 
 
 # ── Employees ──────────────────────────────────────────────────────────────────
 
 def upsert_employee(name: str, email: str, role: str = "", department: str = "", phone: str = "") -> str:
-    """Insert or update an employee record. Returns a confirmation string."""
+    """Insert or update an employee record. Roles accumulate: if the same
+    email is seen with a different role, the new role is appended to the
+    existing comma-separated role list (deduplicated case-insensitively)."""
     with get_conn() as conn:
+        existing = conn.execute(
+            "SELECT id, role FROM employees WHERE LOWER(email)=LOWER(?)", (email,)
+        ).fetchone()
+        if existing:
+            merged_role = _merge_roles(existing["role"] or "", role)
+            conn.execute("""
+                UPDATE employees
+                SET name=?,
+                    role=?,
+                    department=COALESCE(NULLIF(?,  ''), department),
+                    phone=COALESCE(NULLIF(?,  ''), phone)
+                WHERE id=?
+            """, (name, merged_role, department, phone, existing["id"]))
+            return f"Employee '{name}' ({email}) updated. Roles: {merged_role}"
         conn.execute("""
             INSERT INTO employees (name, email, role, department, phone)
             VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(email) DO UPDATE SET
-                name=excluded.name,
-                role=COALESCE(NULLIF(excluded.role,''), role),
-                department=COALESCE(NULLIF(excluded.department,''), department),
-                phone=COALESCE(NULLIF(excluded.phone,''), phone)
         """, (name, email, role, department, phone))
     return f"Employee '{name}' ({email}) saved."
 
@@ -181,25 +278,45 @@ def list_property_managers() -> str:
 def upsert_key_contact(
     name: str, role: str, email: str = "", phone: str = "", company: str = "", notes: str = ""
 ) -> str:
-    """Insert or update a key contact (tenant, contractor, landlord, etc.)."""
+    """Insert or update a key contact (tenant, contractor, landlord, etc.).
+
+    Dedupe key: LOWER(email) when email is present, otherwise LOWER(name).
+    When the same person is seen with a different role, the new role is
+    APPENDED to the existing comma-separated role list (deduplicated
+    case-insensitively) — they are no longer split into multiple rows.
+    """
     with get_conn() as conn:
-        existing = conn.execute(
-            "SELECT id FROM key_contacts WHERE name=? AND role=?", (name, role)
-        ).fetchone()
+        if email:
+            existing = conn.execute(
+                "SELECT id, role, phone, company, notes FROM key_contacts "
+                "WHERE LOWER(email)=LOWER(?)",
+                (email,),
+            ).fetchone()
+        else:
+            existing = conn.execute(
+                "SELECT id, role, phone, company, notes FROM key_contacts "
+                "WHERE LOWER(name)=LOWER(?) AND (email='' OR email IS NULL)",
+                (name,),
+            ).fetchone()
+
         if existing:
+            merged_role = _merge_roles(existing["role"] or "", role)
             conn.execute("""
                 UPDATE key_contacts
-                SET email=COALESCE(NULLIF(?,  ''), email),
+                SET name=?,
+                    email=COALESCE(NULLIF(?,  ''), email),
                     phone=COALESCE(NULLIF(?,  ''), phone),
+                    role=?,
                     company=COALESCE(NULLIF(?,  ''), company),
                     notes=COALESCE(NULLIF(?,  ''), notes)
                 WHERE id=?
-            """, (email, phone, company, notes, existing["id"]))
-        else:
-            conn.execute("""
-                INSERT INTO key_contacts (name, email, phone, role, company, notes)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (name, email, phone, role, company, notes))
+            """, (name, email, phone, merged_role, company, notes, existing["id"]))
+            return f"Contact '{name}' updated. Roles: {merged_role}"
+
+        conn.execute("""
+            INSERT INTO key_contacts (name, email, phone, role, company, notes)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (name, email, phone, role, company, notes))
     return f"Contact '{name}' ({role}) saved."
 
 
