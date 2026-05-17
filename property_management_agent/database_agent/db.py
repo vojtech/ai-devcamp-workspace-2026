@@ -8,9 +8,16 @@ import sqlite3
 from datetime import datetime
 from typing import Any
 
-DB_PATH = os.getenv(
-    "DB_PATH",
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "property_data.db"),
+# Resolve DB_PATH so a relative value from .env (e.g. DB_PATH=property_data.db)
+# is interpreted relative to the property_management_agent package dir, NOT the
+# current working directory. Otherwise the DB ends up wherever `adk web` was
+# launched, which silently splits writes across multiple files.
+_AGENT_DIR = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+_RAW_DB_PATH = os.getenv("DB_PATH") or "property_data.db"
+DB_PATH = (
+    _RAW_DB_PATH
+    if os.path.isabs(_RAW_DB_PATH)
+    else os.path.normpath(os.path.join(_AGENT_DIR, _RAW_DB_PATH))
 )
 
 

@@ -16,11 +16,12 @@ import pandas as pd
 import streamlit as st
 
 # ── DB location ─────────────────────────────────────────────────────────────────
-# Same default the agents use: property_data.db one level above database_agent/
-DEFAULT_DB = (
-    Path(__file__).resolve().parent.parent / "property_data.db"
-)
-DB_PATH = os.getenv("DB_PATH", str(DEFAULT_DB))
+# Use the exact same resolution logic the agent's db.py applies, so the UI
+# always points at the file the agent is actually writing to — even when the
+# user sets DB_PATH (relative or absolute) in .env.
+_AGENT_DIR = Path(__file__).resolve().parent.parent
+_RAW = os.getenv("DB_PATH") or "property_data.db"
+DB_PATH = _RAW if os.path.isabs(_RAW) else os.path.normpath(str(_AGENT_DIR / _RAW))
 
 
 @st.cache_data(ttl=5)  # refresh every 5s; auto-busts when user clicks Refresh
