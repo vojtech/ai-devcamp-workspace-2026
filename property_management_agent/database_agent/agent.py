@@ -16,6 +16,10 @@ from .db import (
     list_tasks,
     add_meeting,
     list_meetings,
+    save_email_classification,
+    list_email_classifications,
+    get_email_classification,
+    classification_counts,
     get_db_summary,
 )
 
@@ -24,8 +28,9 @@ database_agent = Agent(
     model="gemini-2.5-flash",
     description=(
         "Manages the property management SQLite database. "
-        "Call this agent to save employees, property managers, key contacts, tasks, "
-        "and meetings, or to retrieve any stored data."
+        "Saves and retrieves employees, property managers, key contacts, tasks, "
+        "meetings, and per-email classifications. Use it to browse / filter "
+        "classified emails by category, urgency, tag, or required action."
     ),
     instruction="""
 You are the database manager for a property management email analysis system.
@@ -56,6 +61,25 @@ MEETINGS:
   add_meeting(title, date, time, attendees, location, agenda, source_email)
   list_meetings()
 
+EMAIL CLASSIFICATIONS  (produced by the classifier_agent):
+  save_email_classification(
+      thread_id, category, summary,
+      message_id, subject, sender, date,
+      subcategory, tags, urgency, sentiment, requires_action
+  )
+    → category: maintenance | billing | leasing | legal | handover |
+                complaint | emergency | administrative | communication | other
+    → urgency:  low | normal | high | urgent
+    → sentiment: positive | neutral | negative
+    → tags: JSON array string OR comma-separated string
+    → requires_action: true / false
+
+  list_email_classifications(category, urgency, sentiment, requires_action, tag, limit)
+    → All filters are optional; "" means no filter.
+
+  get_email_classification(thread_id, message_id)
+  classification_counts()
+
 SUMMARY:
   get_db_summary()
 
@@ -77,6 +101,10 @@ Rules:
         list_tasks,
         add_meeting,
         list_meetings,
+        save_email_classification,
+        list_email_classifications,
+        get_email_classification,
+        classification_counts,
         get_db_summary,
     ],
 )
