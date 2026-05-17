@@ -4,3 +4,6 @@ google-auth-oauthlib>=1.0.0
 google-api-python-client>=2.0.0
 httpx>=0.27.0
 mcp>=1.0.0
+# UI (optional — install only if you want to run the Streamlit data browser)
+streamlit>=1.30.0
+pandas>=2.0.0
