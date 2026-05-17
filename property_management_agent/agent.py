@@ -40,7 +40,9 @@ AGENT_DIR = os.path.dirname(os.path.abspath(__file__))
 TOKEN_PATH = os.path.join(AGENT_DIR, "token.json")
 CREDENTIALS_PATH = os.path.join(AGENT_DIR, "credentials-web.json")
 GMAIL_MCP_URL = "https://gmailmcp.googleapis.com/mcp/v1"
-AUTH_PORT = 8765  # OAuth callback port (must not clash with adk web port 8000)
+AUTH_PORT = 8080  # OAuth callback port — must match a redirect URI registered
+                  # in your Google Cloud OAuth client (credentials-web.json).
+                  # 8080 is the one already registered for this project.
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",
     "https://www.googleapis.com/auth/gmail.compose",
