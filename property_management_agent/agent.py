@@ -3,7 +3,7 @@ Property Management Email Analyzer — root agent.
 
 Architecture:
   root_agent (property_email_analyzer)
-  │  Gmail MCP tools  → https://gmailmcp.googleapis.com/mcp/v1  (Bearer OAuth)
+  │  Gmail MCP tools  → https://gmailmcp.googleapis.com/mcp/v1  (SSE, Bearer OAuth)
   │    • search_threads(query, max_results)
   │    • get_thread(thread_id)
   │  Python extraction tools (deterministic regex helpers)
@@ -24,7 +24,7 @@ from typing import Optional
 
 from google.adk.agents import Agent
 from google.adk.tools.agent_tool import AgentTool
-from google.adk.tools.mcp_tool import McpToolset, StreamableHTTPConnectionParams
+from google.adk.tools.mcp_tool import McpToolset, SseConnectionParams
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 
@@ -72,8 +72,10 @@ def _load_access_token() -> str:
 
 
 # ── Gmail MCP toolset (official Google server) ─────────────────────────────────
+# Uses SseConnectionParams — StreamableHTTPConnectionParams triggers an anyio
+# cancel-scope bug (MCP 1.27 + ADK) causing "exit cancel scope in different task".
 gmail_tools = McpToolset(
-    connection_params=StreamableHTTPConnectionParams(
+    connection_params=SseConnectionParams(
         url=GMAIL_MCP_URL,
         headers={"Authorization": f"Bearer {_load_access_token()}"},
     )
