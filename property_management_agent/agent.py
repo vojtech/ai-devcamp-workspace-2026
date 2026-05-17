@@ -3,10 +3,11 @@ Property Management Email Analyzer — root agent.
 
 Architecture:
   root_agent (property_email_analyzer)
-  │  Gmail MCP tools  → https://gmailmcp.googleapis.com/mcp/v1  (JSON-RPC over httpx)
-  │    • search_threads(query, page_size, page_token)
-  │    • get_thread(thread_id, message_format)
-  │  (Direct httpx calls — MCP Python SDK transports have async bugs with ADK)
+  │  Gmail tools  → Gmail REST API via googleapiclient
+  │    • search_threads(query, page_size)
+  │    • get_thread(thread_id)
+  │  (Same OAuth flow as the Gmail MCP path; bypasses the gmailmcp.googleapis.com
+  │   developer-preview gate by talking to the standard Gmail API directly.)
   │  Python extraction tools (deterministic regex helpers)
   │    • extract_employees_from_text
   │    • extract_managers_from_text
@@ -16,18 +17,22 @@ Architecture:
   │
   └─ AgentTool → database_agent (manages SQLite via direct Python functions)
 """
+import base64
 import json
 import logging
 import os
 import re
 import sys
+import threading
 from typing import Optional
 
-import httpx
 from google.adk.agents import Agent
 from google.adk.tools.agent_tool import AgentTool
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
 from .database_agent.agent import database_agent
 
@@ -36,132 +41,215 @@ logger = logging.getLogger(__name__)
 
 AGENT_DIR = os.path.dirname(os.path.abspath(__file__))
 TOKEN_PATH = os.path.join(AGENT_DIR, "token.json")
-GMAIL_MCP_URL = "https://gmailmcp.googleapis.com/mcp/v1"
-SCOPES = [
-    "https://www.googleapis.com/auth/gmail.readonly",
-    "https://www.googleapis.com/auth/gmail.compose",
-]
+CREDENTIALS_PATH = os.path.join(AGENT_DIR, "credentials-web.json")
+AUTH_PORT = 8080  # OAuth callback port — must match a redirect URI registered
+                  # in your Google Cloud OAuth client (credentials-web.json).
+SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
+
+# ── Auth state (shared between background thread and callers) ─────────────────
+_auth_thread: Optional[threading.Thread] = None
+_auth_done = threading.Event()
+_auth_error: Optional[str] = None
 
 
-def _load_access_token() -> str:
-    """Return a valid OAuth access token, refreshing if needed.
-    Returns empty string if token.json is missing or invalid."""
+def _run_auth_flow() -> None:
+    """Runs the OAuth flow in a background thread, opens the browser, saves token.json."""
+    global _auth_error
+    try:
+        flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_PATH, SCOPES)
+        creds = flow.run_local_server(port=AUTH_PORT, open_browser=True)
+        with open(TOKEN_PATH, "w") as f:
+            f.write(creds.to_json())
+        logger.info("Gmail auth completed — token.json saved.")
+    except Exception as e:
+        _auth_error = str(e)
+        logger.error(f"Gmail auth failed: {e}")
+    finally:
+        _auth_done.set()
+
+
+def _get_valid_credentials() -> Optional[Credentials]:
+    """Load valid credentials from token.json, refreshing if expired. Returns None if missing."""
     if not os.path.exists(TOKEN_PATH):
-        logger.warning(
-            "token.json not found. Run:  python3.11 property_management_agent/login.py"
-        )
-        return ""
+        return None
     try:
         creds = Credentials.from_authorized_user_file(TOKEN_PATH, SCOPES)
-        if not creds.valid:
-            if creds.expired and creds.refresh_token:
-                logger.info("Refreshing Gmail OAuth token...")
-                creds.refresh(Request())
-                with open(TOKEN_PATH, "w") as f:
-                    f.write(creds.to_json())
-            else:
-                logger.warning(
-                    "Gmail token invalid. Run:  python3.11 property_management_agent/login.py"
-                )
-                return ""
-        return creds.token
+        if creds.valid:
+            return creds
+        if creds.expired and creds.refresh_token:
+            logger.info("Refreshing Gmail OAuth token...")
+            creds.refresh(Request())
+            with open(TOKEN_PATH, "w") as f:
+                f.write(creds.to_json())
+            return creds
     except Exception as e:
-        logger.warning(f"Could not load Gmail token: {e}")
-        return ""
+        logger.warning(f"Error loading credentials: {e}")
+    return None
 
 
-# ── Gmail MCP JSON-RPC client ──────────────────────────────────────────────────
-# Calls the official Google Gmail MCP server (gmailmcp.googleapis.com) directly
-# via httpx. The MCP Python SDK transports (Streamable HTTP, SSE) have async
-# task-management bugs with ADK, so we bypass them and speak JSON-RPC ourselves.
+def _ensure_authenticated() -> tuple[Optional[str], Optional[str]]:
+    """Return (token, user_message). If token is None, user_message tells the
+    user what to do (browser opened, sign-in in progress, etc.)."""
+    global _auth_thread, _auth_error
 
-def _mcp_call(tool_name: str, arguments: dict) -> dict:
-    """Invoke a Gmail MCP tool via JSON-RPC over HTTP. Returns the parsed result dict."""
-    token = _load_access_token()
-    if not token:
-        return {"isError": True, "error": "Not authenticated. Run login.py first."}
-    payload = {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "tools/call",
-        "params": {"name": tool_name, "arguments": arguments},
-    }
-    try:
-        resp = httpx.post(
-            GMAIL_MCP_URL,
-            json=payload,
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-            },
-            timeout=60.0,
+    creds = _get_valid_credentials()
+    if creds is not None:
+        return creds.token, None
+
+    # No valid token — need to authenticate
+    if not os.path.exists(CREDENTIALS_PATH):
+        return None, (
+            f"Gmail authentication required but credentials-web.json is missing.\n"
+            f"Place your OAuth client JSON at: {CREDENTIALS_PATH}"
         )
-        resp.raise_for_status()
-        data = resp.json()
-        if "error" in data:
-            return {"isError": True, "error": data["error"]}
-        return data.get("result", {})
-    except httpx.HTTPError as e:
-        return {"isError": True, "error": f"HTTP error: {e}"}
+
+    # Previous auth attempt failed — reset and allow retry
+    if _auth_done.is_set() and _auth_error:
+        err = _auth_error
+        _auth_thread = None
+        _auth_done.clear()
+        _auth_error = None
+        return None, (
+            f"Gmail authentication failed: {err}\n"
+            "Please ask me again to retry — a new browser window will open."
+        )
+
+    # Auth still in progress
+    if _auth_thread is not None and _auth_thread.is_alive():
+        return None, (
+            "Gmail sign-in is in progress. Please complete the sign-in in the "
+            "browser window that opened, then ask me again to continue."
+        )
+
+    # Start a fresh auth flow — opens the browser automatically
+    _auth_done.clear()
+    _auth_error = None
+    _auth_thread = threading.Thread(target=_run_auth_flow, daemon=True)
+    _auth_thread.start()
+    return None, (
+        "Gmail authentication required. A browser window has just been opened "
+        "for you to sign in to your Google account. Please grant the requested "
+        "permissions, then ask me again to fetch your emails."
+    )
 
 
-def search_threads(query: str = "", page_size: int = 20, page_token: str = "") -> str:
+# ── Gmail REST API client (via googleapiclient) ───────────────────────────────
+# Uses the standard Gmail API (gmail.googleapis.com), not the Gmail MCP server.
+# Same OAuth token, no developer-preview gating.
+
+def _get_gmail_service():
+    """Build a Gmail API service object using the user's OAuth credentials.
+    Returns (service, error_dict_or_None). If error_dict is set, surface it
+    to the user instead of using the service."""
+    token, user_message = _ensure_authenticated()
+    if token is None:
+        return None, {"isError": True, "needsAuth": True, "message": user_message}
+    try:
+        creds = _get_valid_credentials()
+        return build("gmail", "v1", credentials=creds, cache_discovery=False), None
+    except Exception as e:
+        return None, {"isError": True, "message": f"Could not build Gmail service: {e}"}
+
+
+def _decode_body(part: dict) -> str:
+    """Recursively walk a Gmail message payload to extract plain-text body."""
+    mime = part.get("mimeType", "")
+    body_data = part.get("body", {}).get("data")
+    if mime == "text/plain" and body_data:
+        try:
+            return base64.urlsafe_b64decode(body_data).decode("utf-8", errors="replace")
+        except Exception:
+            return ""
+    # Prefer text/plain in subparts; fall back to first text/html stripped.
+    text_plain = ""
+    text_html = ""
+    for sub in part.get("parts", []) or []:
+        sub_mime = sub.get("mimeType", "")
+        if sub_mime == "text/plain":
+            text_plain = text_plain or _decode_body(sub)
+        elif sub_mime == "text/html":
+            text_html = text_html or _decode_body(sub)
+        elif sub_mime.startswith("multipart/"):
+            inner = _decode_body(sub)
+            if inner:
+                text_plain = text_plain or inner
+    if text_plain:
+        return text_plain
+    if text_html and not body_data:
+        return re.sub(r"<[^>]+>", " ", text_html)
+    if mime == "text/html" and body_data:
+        raw = base64.urlsafe_b64decode(body_data).decode("utf-8", errors="replace")
+        return re.sub(r"<[^>]+>", " ", raw)
+    return ""
+
+
+def search_threads(query: str = "", page_size: int = 20) -> str:
     """
-    Search Gmail threads using the official Gmail MCP server.
+    Search Gmail threads using the standard Gmail REST API.
     Use Gmail search syntax in the query, e.g. "from:@acme-property.com".
 
     Args:
         query: Gmail search query string (Gmail syntax).
-        page_size: Max threads to return (default 20, max 50).
-        page_token: Optional token to fetch next page of results.
+        page_size: Max threads to return (default 20, max 100).
 
     Returns:
-        JSON string with thread list. Each thread has an id and snippet.
+        JSON string with {"threads": [{"id": "...", "snippet": "..."}, ...]}.
     """
-    args: dict = {"query": query, "pageSize": max(1, min(page_size, 50))}
-    if page_token:
-        args["pageToken"] = page_token
-    result = _mcp_call("search_threads", args)
-    if result.get("isError"):
-        return json.dumps(result)
-    # Unwrap MCP content[].text → parsed JSON when possible
-    content = result.get("content", [])
-    if content and content[0].get("type") == "text":
-        text = content[0].get("text", "")
-        try:
-            return json.dumps(json.loads(text))
-        except json.JSONDecodeError:
-            return json.dumps({"raw": text})
-    return json.dumps(result)
+    service, err = _get_gmail_service()
+    if err:
+        return json.dumps(err)
+    try:
+        result = (
+            service.users()
+            .threads()
+            .list(userId="me", q=query, maxResults=max(1, min(page_size, 100)))
+            .execute()
+        )
+        threads = result.get("threads", [])
+        return json.dumps({
+            "count": len(threads),
+            "threads": [{"id": t["id"], "snippet": t.get("snippet", "")} for t in threads],
+        })
+    except HttpError as e:
+        return json.dumps({"isError": True, "message": f"Gmail API error: {e}"})
 
 
-def get_thread(thread_id: str, message_format: str = "FULL_CONTENT") -> str:
+def get_thread(thread_id: str) -> str:
     """
-    Fetch the full content of a Gmail thread by its ID, using the official Gmail MCP server.
+    Fetch the full content of a Gmail thread by its ID, using the Gmail REST API.
 
     Args:
         thread_id: The Gmail thread ID (returned by search_threads).
-        message_format: "FULL_CONTENT" (default) or "MINIMAL".
 
     Returns:
-        JSON string with the full thread including all messages (from, to,
-        subject, date, body text).
+        JSON string with {"id": "...", "messages": [{from, to, subject, date, body}, ...]}.
     """
-    result = _mcp_call(
-        "get_thread",
-        {"threadId": thread_id, "messageFormat": message_format},
-    )
-    if result.get("isError"):
-        return json.dumps(result)
-    content = result.get("content", [])
-    if content and content[0].get("type") == "text":
-        text = content[0].get("text", "")
-        try:
-            return json.dumps(json.loads(text))
-        except json.JSONDecodeError:
-            return json.dumps({"raw": text})
-    return json.dumps(result)
+    service, err = _get_gmail_service()
+    if err:
+        return json.dumps(err)
+    try:
+        thread = (
+            service.users()
+            .threads()
+            .get(userId="me", id=thread_id, format="full")
+            .execute()
+        )
+        messages_out = []
+        for msg in thread.get("messages", []):
+            payload = msg.get("payload", {})
+            headers = {h["name"]: h["value"] for h in payload.get("headers", [])}
+            messages_out.append({
+                "id": msg.get("id", ""),
+                "from": headers.get("From", ""),
+                "to": headers.get("To", ""),
+                "cc": headers.get("Cc", ""),
+                "subject": headers.get("Subject", ""),
+                "date": headers.get("Date", ""),
+                "body": _decode_body(payload),
+            })
+        return json.dumps({"id": thread.get("id", thread_id), "messages": messages_out})
+    except HttpError as e:
+        return json.dumps({"isError": True, "message": f"Gmail API error: {e}"})
 
 
 # ── Python extraction helpers (called by the LLM as tools) ────────────────────
@@ -377,17 +465,81 @@ db_tool = AgentTool(agent=database_agent)
 root_agent = Agent(
     name="property_email_analyzer",
     model="gemini-2.5-flash",
-    description="Analyses emails from a property management company domain and extracts structured intelligence.",
+    description=(
+        "Email intelligence agent. Answers freeform questions about your "
+        "Gmail (latest emails, summaries, who is involved), and on request "
+        "performs bulk analysis of a property-management domain's emails to "
+        "extract employees, managers, contacts, tasks, and meetings into SQLite."
+    ),
     instruction="""
 You are an expert email intelligence agent for property management.
 
 You have access to:
-  Gmail MCP tools (search_threads, get_thread) — for fetching real emails
+  Gmail tools (search_threads, get_thread) — for fetching real emails
   Extraction tools — deterministic helpers for parsing email text
   database_agent tool — for persisting and retrieving all extracted data
 
 ═══════════════════════════════════════════
-MAIN WORKFLOW — "analyse emails from <domain>"
+INTENT ROUTING — pick the right mode for the user's question
+═══════════════════════════════════════════
+
+A) FREEFORM EMAIL Q&A  (default for any natural-language email question)
+   Examples:
+     "What's the latest email?"
+     "Show me my most recent email from acme-property.com"
+     "Summarize the last conversation with Sarah Jones"
+     "What did the property manager say about the boiler?"
+     "Any emails about Unit 12B?"
+   → Use FREEFORM Q&A WORKFLOW (below). Do NOT persist anything to the DB.
+
+B) BULK ANALYSIS  (explicit: "analyse / scan / extract all emails from <domain>")
+   → Use MAIN ANALYSIS WORKFLOW (below). Persist everything via database_agent.
+
+C) DATABASE QUERIES  ("show summary", "list employees", "list tasks", etc.)
+   → Delegate directly to database_agent.
+
+═══════════════════════════════════════════
+FREEFORM Q&A WORKFLOW
+═══════════════════════════════════════════
+
+Step 1 — TRANSLATE the user's question to a Gmail search query.
+  Use Gmail search syntax. Examples:
+    "latest email"                     → query=""                    (no filter, sorted newest first)
+    "latest email from acme"           → query="from:acme"
+    "emails about boiler"              → query="boiler"
+    "recent email from Sarah Jones"    → query="from:Sarah Jones"
+    "emails this week"                 → query="newer_than:7d"
+  Use page_size=1 for "latest/most recent", page_size=5-10 for "recent emails".
+
+Step 2 — FETCH
+  Call search_threads(query=..., page_size=N).
+  For each returned thread_id, call get_thread(thread_id=...).
+
+Step 3 — ANSWER the user with a short, structured response:
+  ┌─ EMAIL SUMMARY ──────────────────────────────────
+  │ Subject:  <subject of the latest message>
+  │ Date:     <date>
+  │ From:     <sender name + email>
+  │
+  │ INVOLVED PEOPLE
+  │   • <name> <email> — <role if known from signature>
+  │   • <name> <email> — <role>
+  │   (deduplicate; include everyone in From/To/Cc and anyone clearly
+  │    referenced in the body)
+  │
+  │ SUMMARY OF THE CONVERSATION
+  │   <2–5 sentence plain-English summary of what's being discussed,
+  │    decisions made, and any action items or dates mentioned.>
+  └──────────────────────────────────────────────────
+
+  If the thread has multiple messages, summarise the whole thread
+  (not just the latest message) and note who replied to whom.
+
+  Do NOT call extraction tools or database_agent in this mode unless
+  the user explicitly asks to "save" or "remember" something.
+
+═══════════════════════════════════════════
+MAIN ANALYSIS WORKFLOW — "analyse emails from <domain>"
 ═══════════════════════════════════════════
 
 Step 1 — SEARCH
@@ -439,7 +591,7 @@ Step 4 — FINAL REPORT
   └────────────────────────────────────────────────────────
 
 ═══════════════════════════════════════════
-QUICK COMMANDS
+QUICK COMMANDS (database queries — delegate to database_agent)
 ═══════════════════════════════════════════
   "show summary"     → database_agent: get_db_summary()
   "list employees"   → database_agent: list_employees()
@@ -449,15 +601,24 @@ QUICK COMMANDS
   "list managers"    → database_agent: list_property_managers()
 
 ═══════════════════════════════════════════
-RULES
+RULES (apply to MAIN ANALYSIS WORKFLOW; freeform Q&A is read-only)
 ═══════════════════════════════════════════
-- Always use from:@domain.com in the Gmail search query.
+- In the analysis workflow, always use from:@domain.com in the Gmail query.
 - Process every thread returned — do not skip any.
 - Use "" (empty string) for unknown fields, never None or "unknown".
-- Never hallucinate data — only store what is explicitly in the emails.
+- Never hallucinate data — only state/store what is explicitly in the emails.
 - Employees = anyone with a @<domain> email address.
 - Key contacts = external people (tenants, landlords, contractors).
 - If current vs previous manager is ambiguous, mark as "current" and note it.
+- Freeform Q&A NEVER writes to the database — it just answers the question.
+
+AUTHENTICATION HANDLING
+- If a Gmail tool returns {"needsAuth": true, "message": "..."}, this means
+  the user is not signed in to Google. STOP the workflow and reply with the
+  exact text from the "message" field. Do not retry, do not try other tools,
+  do not apologise — just relay the message so the user sees what to do.
+- After the user completes sign-in and asks again, retry the workflow from
+  the start.
 """,
     tools=[
         search_threads,
