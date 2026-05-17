@@ -164,7 +164,16 @@ def _mcp_call(tool_name: str, arguments: dict) -> dict:
             },
             timeout=60.0,
         )
-        resp.raise_for_status()
+        # Log full response body for diagnostic purposes (especially auth/scope issues)
+        if resp.status_code >= 400 or "Forbidden" in resp.reason_phrase:
+            logger.error(
+                f"Gmail MCP error: HTTP {resp.status_code} {resp.reason_phrase}\n"
+                f"Response body: {resp.text[:500]}"
+            )
+            return {
+                "isError": True,
+                "message": f"Gmail MCP server returned {resp.status_code} {resp.reason_phrase}: {resp.text[:300]}",
+            }
         data = resp.json()
         if "error" in data:
             return {"isError": True, "error": data["error"]}
