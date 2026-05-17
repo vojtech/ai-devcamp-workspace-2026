@@ -34,6 +34,7 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
+from .classifier_agent.agent import classifier_agent
 from .database_agent.agent import database_agent
 
 logging.basicConfig(stream=sys.stderr, level=logging.INFO)
@@ -461,6 +462,7 @@ def extract_meetings_from_text(text: str, source_email: str = "") -> str:
 # ── Root agent ─────────────────────────────────────────────────────────────────
 
 db_tool = AgentTool(agent=database_agent)
+classifier_tool = AgentTool(agent=classifier_agent)
 
 root_agent = Agent(
     name="property_email_analyzer",
@@ -497,6 +499,16 @@ B) BULK ANALYSIS  (explicit: "analyse / scan / extract all emails from <domain>"
 
 C) DATABASE QUERIES  ("show summary", "list employees", "list tasks", etc.)
    → Delegate directly to database_agent.
+
+D) CLASSIFIED-EMAIL BROWSING  (filter previously-analysed emails by flags)
+   Examples:
+     "Show urgent emails"
+     "Any emails about maintenance?"
+     "List emails that require action"
+     "What complaints did we get?"
+     "How many emails per category?"
+   → Delegate to database_agent (list_email_classifications with filters,
+     or classification_counts for aggregates). Do NOT re-fetch from Gmail.
 
 ═══════════════════════════════════════════
 FREEFORM Q&A WORKFLOW
@@ -546,7 +558,7 @@ Step 1 — SEARCH
   Call: search_threads(query="from:@<domain>", max_results=50)
   Note every thread_id returned.
 
-Step 2 — FETCH & EXTRACT (repeat for each thread_id)
+Step 2 — FETCH, EXTRACT & CLASSIFY (repeat for each thread_id)
   a) Call: get_thread(thread_id=<id>)
      Extract the plain-text body and subject from the returned thread content.
 
@@ -557,17 +569,29 @@ Step 2 — FETCH & EXTRACT (repeat for each thread_id)
        extract_tasks_from_text(text=<body>, source_email=<subject>)
        extract_meetings_from_text(text=<body>, source_email=<subject>)
 
-  c) Also use your own understanding to catch anything the regex tools miss —
+  c) Call classifier_agent with the email content to get a structured
+     classification:
+       classifier_agent("Classify this email.\\nSubject: <subject>\\n"
+                        "From: <sender>\\nDate: <date>\\nBody:\\n<body>")
+     It returns RAW JSON with:
+       {category, subcategory, tags, urgency, sentiment, requires_action, summary}
+
+  d) Also use your own understanding to catch anything the regex tools miss —
      especially property manager transitions, role-specific contacts, and
      implicit tasks (e.g. "please chase the rent", "can you arrange inspection").
 
 Step 3 — STORE via database_agent
-  After each email (or in small batches), instruct the database_agent tool to save:
+  After each email (or in small batches), instruct database_agent to save:
   - Each employee: "Save employee: name=X, email=Y, role=Z"
   - Each manager: "Save property manager: name=X, email=Y, status=current/previous"
   - Each contact: "Save contact: name=X, role=Tenant/Landlord/Contractor, email=Y, phone=Z"
   - Each task: "Save task: title=X, due_date=Y, priority=normal/high, source_email=Z"
   - Each meeting: "Save meeting: title=X, date=Y, attendees=Z, location=W"
+  - The classification: "Save email classification: thread_id=<id>,
+        message_id=<msg_id>, subject=<...>, sender=<...>, date=<...>,
+        category=<...>, subcategory=<...>, tags=<json-array-or-csv>,
+        urgency=<...>, sentiment=<...>, requires_action=<true|false>,
+        summary=<...>"
 
 Step 4 — FINAL REPORT
   Call database_agent: "Call get_db_summary and list_tasks(status=open)"
@@ -593,12 +617,19 @@ Step 4 — FINAL REPORT
 ═══════════════════════════════════════════
 QUICK COMMANDS (database queries — delegate to database_agent)
 ═══════════════════════════════════════════
-  "show summary"     → database_agent: get_db_summary()
-  "list employees"   → database_agent: list_employees()
-  "list tasks"       → database_agent: list_tasks()
-  "list meetings"    → database_agent: list_meetings()
-  "list contacts"    → database_agent: list_key_contacts()
-  "list managers"    → database_agent: list_property_managers()
+  "show summary"            → database_agent: get_db_summary()
+  "list employees"          → database_agent: list_employees()
+  "list tasks"              → database_agent: list_tasks()
+  "list meetings"           → database_agent: list_meetings()
+  "list contacts"           → database_agent: list_key_contacts()
+  "list managers"           → database_agent: list_property_managers()
+
+  Classification browsing:
+  "category counts"         → database_agent: classification_counts()
+  "urgent emails"           → database_agent: list_email_classifications(urgency="urgent")
+  "maintenance emails"      → database_agent: list_email_classifications(category="maintenance")
+  "emails needing action"   → database_agent: list_email_classifications(requires_action="true")
+  "emails tagged X"         → database_agent: list_email_classifications(tag="X")
 
 ═══════════════════════════════════════════
 RULES (apply to MAIN ANALYSIS WORKFLOW; freeform Q&A is read-only)
@@ -628,6 +659,7 @@ AUTHENTICATION HANDLING
         extract_contacts_from_text,
         extract_tasks_from_text,
         extract_meetings_from_text,
+        classifier_tool,
         db_tool,
     ],
 )

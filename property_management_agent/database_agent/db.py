@@ -78,6 +78,30 @@ def init_db() -> None:
                 source_email TEXT,
                 created_at   DATETIME DEFAULT CURRENT_TIMESTAMP
             );
+
+            -- Per-email classification produced by the classifier_agent.
+            -- One row per (thread_id, message_id); tags is a JSON array string.
+            CREATE TABLE IF NOT EXISTS email_classifications (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                thread_id        TEXT NOT NULL,
+                message_id       TEXT DEFAULT '',
+                subject          TEXT,
+                sender           TEXT,
+                date             TEXT,
+                category         TEXT,
+                subcategory      TEXT,
+                tags             TEXT DEFAULT '[]',
+                urgency          TEXT DEFAULT 'normal',
+                sentiment        TEXT DEFAULT 'neutral',
+                requires_action  INTEGER DEFAULT 0,
+                summary          TEXT,
+                classified_at    DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(thread_id, message_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_class_category ON email_classifications(category);
+            CREATE INDEX IF NOT EXISTS idx_class_urgency  ON email_classifications(urgency);
+            CREATE INDEX IF NOT EXISTS idx_class_action   ON email_classifications(requires_action);
         """)
 
 
@@ -249,6 +273,184 @@ def list_meetings() -> str:
     return json.dumps([dict(r) for r in rows], default=str)
 
 
+# ── Email Classifications ─────────────────────────────────────────────────────
+# Produced by the classifier_agent. Used to filter emails in the DB and let
+# the AI browse data by category / urgency / action-required / tags.
+
+VALID_CATEGORIES = {
+    "maintenance", "billing", "leasing", "legal", "handover",
+    "complaint", "emergency", "administrative", "communication", "other",
+}
+VALID_URGENCY = {"low", "normal", "high", "urgent"}
+VALID_SENTIMENT = {"positive", "neutral", "negative"}
+
+
+def save_email_classification(
+    thread_id: str,
+    category: str,
+    summary: str,
+    message_id: str = "",
+    subject: str = "",
+    sender: str = "",
+    date: str = "",
+    subcategory: str = "",
+    tags: str = "",
+    urgency: str = "normal",
+    sentiment: str = "neutral",
+    requires_action: bool = False,
+) -> str:
+    """
+    Save (or replace) the classification for a specific email.
+
+    Args:
+        thread_id: Gmail thread ID (required).
+        category: One of maintenance, billing, leasing, legal, handover,
+                  complaint, emergency, administrative, communication, other.
+        summary: 1-2 sentence summary of the email content.
+        message_id: Gmail message ID inside the thread (optional).
+        subject, sender, date: Email metadata.
+        subcategory: Free-form refinement (e.g. "boiler repair", "rent arrears").
+        tags: Either a JSON array string like '["urgent","follow-up"]' OR a
+              comma-separated string like "urgent,follow-up" (auto-normalised).
+        urgency: low | normal | high | urgent.
+        sentiment: positive | neutral | negative.
+        requires_action: True if this email needs follow-up action.
+    """
+    if category not in VALID_CATEGORIES:
+        category = "other"
+    if urgency not in VALID_URGENCY:
+        urgency = "normal"
+    if sentiment not in VALID_SENTIMENT:
+        sentiment = "neutral"
+
+    # Normalise tags to a JSON array string
+    tags_json = "[]"
+    if tags:
+        tags = tags.strip()
+        try:
+            parsed = json.loads(tags)
+            if isinstance(parsed, list):
+                tags_json = json.dumps([str(t).strip() for t in parsed if str(t).strip()])
+        except (json.JSONDecodeError, ValueError):
+            parts = [t.strip() for t in tags.split(",") if t.strip()]
+            tags_json = json.dumps(parts)
+
+    with get_conn() as conn:
+        conn.execute("""
+            INSERT INTO email_classifications
+                (thread_id, message_id, subject, sender, date, category,
+                 subcategory, tags, urgency, sentiment, requires_action, summary)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(thread_id, message_id) DO UPDATE SET
+                subject         = COALESCE(NULLIF(excluded.subject,''), subject),
+                sender          = COALESCE(NULLIF(excluded.sender,''), sender),
+                date            = COALESCE(NULLIF(excluded.date,''), date),
+                category        = excluded.category,
+                subcategory     = COALESCE(NULLIF(excluded.subcategory,''), subcategory),
+                tags            = excluded.tags,
+                urgency         = excluded.urgency,
+                sentiment       = excluded.sentiment,
+                requires_action = excluded.requires_action,
+                summary         = excluded.summary,
+                classified_at   = CURRENT_TIMESTAMP
+        """, (
+            thread_id, message_id, subject, sender, date, category,
+            subcategory, tags_json, urgency, sentiment, int(bool(requires_action)),
+            summary,
+        ))
+    return f"Classification for thread '{thread_id}' ({category}) saved."
+
+
+def list_email_classifications(
+    category: str = "",
+    urgency: str = "",
+    sentiment: str = "",
+    requires_action: str = "",
+    tag: str = "",
+    limit: int = 50,
+) -> str:
+    """
+    Browse/filter email classifications. Any argument left as "" is ignored.
+
+    Args:
+        category: Filter to a single category (maintenance, billing, etc.).
+        urgency:  Filter to a single urgency level (low/normal/high/urgent).
+        sentiment: Filter to positive/neutral/negative.
+        requires_action: "true" or "false" to filter; "" means no filter.
+        tag: Match a single tag (substring match against the JSON tags column).
+        limit: Max rows to return (default 50).
+
+    Returns:
+        JSON array of classification records, newest first.
+    """
+    where: list[str] = []
+    params: list[Any] = []
+    if category:
+        where.append("category = ?"); params.append(category)
+    if urgency:
+        where.append("urgency = ?"); params.append(urgency)
+    if sentiment:
+        where.append("sentiment = ?"); params.append(sentiment)
+    if requires_action.lower() in ("true", "false"):
+        where.append("requires_action = ?")
+        params.append(1 if requires_action.lower() == "true" else 0)
+    if tag:
+        where.append("tags LIKE ?"); params.append(f'%"{tag}"%')
+
+    sql = "SELECT * FROM email_classifications"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY classified_at DESC LIMIT ?"
+    params.append(max(1, min(int(limit) if str(limit).isdigit() else 50, 500)))
+
+    with get_conn() as conn:
+        rows = conn.execute(sql, params).fetchall()
+    return json.dumps([dict(r) for r in rows], default=str)
+
+
+def get_email_classification(thread_id: str, message_id: str = "") -> str:
+    """Return the classification for a specific (thread_id, message_id) as JSON, or empty object."""
+    with get_conn() as conn:
+        if message_id:
+            row = conn.execute(
+                "SELECT * FROM email_classifications WHERE thread_id=? AND message_id=?",
+                (thread_id, message_id),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT * FROM email_classifications WHERE thread_id=? ORDER BY classified_at DESC LIMIT 1",
+                (thread_id,),
+            ).fetchone()
+    return json.dumps(dict(row) if row else {}, default=str)
+
+
+def classification_counts() -> str:
+    """Return aggregate counts by category, urgency, and requires_action for browsing UIs."""
+    with get_conn() as conn:
+        by_category = {
+            r["category"] or "uncategorised": r["c"]
+            for r in conn.execute(
+                "SELECT category, COUNT(*) AS c FROM email_classifications GROUP BY category"
+            ).fetchall()
+        }
+        by_urgency = {
+            r["urgency"] or "normal": r["c"]
+            for r in conn.execute(
+                "SELECT urgency, COUNT(*) AS c FROM email_classifications GROUP BY urgency"
+            ).fetchall()
+        }
+        action_count = conn.execute(
+            "SELECT COUNT(*) FROM email_classifications WHERE requires_action=1"
+        ).fetchone()[0]
+        total = conn.execute("SELECT COUNT(*) FROM email_classifications").fetchone()[0]
+    return json.dumps({
+        "total": total,
+        "by_category": by_category,
+        "by_urgency": by_urgency,
+        "requires_action": action_count,
+    })
+
+
 # ── Summary ────────────────────────────────────────────────────────────────────
 
 def get_db_summary() -> str:
@@ -263,6 +465,12 @@ def get_db_summary() -> str:
                 "SELECT COUNT(*) FROM tasks WHERE priority='high' AND status='open'"
             ).fetchone()[0],
             "meetings": conn.execute("SELECT COUNT(*) FROM meetings").fetchone()[0],
+            "classified_emails": conn.execute(
+                "SELECT COUNT(*) FROM email_classifications"
+            ).fetchone()[0],
+            "urgent_classified_emails": conn.execute(
+                "SELECT COUNT(*) FROM email_classifications WHERE urgency='urgent'"
+            ).fetchone()[0],
         }
         pm = conn.execute(
             "SELECT name, email FROM property_managers WHERE status='current' LIMIT 1"
