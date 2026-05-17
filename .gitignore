@@ -10,6 +10,10 @@ email_agent/credentials-web.json
 email_agent/token.json
 travel_planner_agent/.env
 email_agent/.env
+property_management_agent/credentials.json
+property_management_agent/credentials-web.json
+property_management_agent/token.json
+property_management_agent/.env
 
 # ==========================================
 # Python Standard Ignores
