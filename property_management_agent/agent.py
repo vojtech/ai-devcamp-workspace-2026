@@ -21,6 +21,7 @@ import logging
 import os
 import re
 import sys
+import threading
 from typing import Optional
 
 import httpx
@@ -28,6 +29,7 @@ from google.adk.agents import Agent
 from google.adk.tools.agent_tool import AgentTool
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
 
 from .database_agent.agent import database_agent
 
@@ -36,38 +38,99 @@ logger = logging.getLogger(__name__)
 
 AGENT_DIR = os.path.dirname(os.path.abspath(__file__))
 TOKEN_PATH = os.path.join(AGENT_DIR, "token.json")
+CREDENTIALS_PATH = os.path.join(AGENT_DIR, "credentials-web.json")
 GMAIL_MCP_URL = "https://gmailmcp.googleapis.com/mcp/v1"
+AUTH_PORT = 8765  # OAuth callback port (must not clash with adk web port 8000)
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",
     "https://www.googleapis.com/auth/gmail.compose",
 ]
 
+# ── Auth state (shared between background thread and callers) ─────────────────
+_auth_thread: Optional[threading.Thread] = None
+_auth_done = threading.Event()
+_auth_error: Optional[str] = None
 
-def _load_access_token() -> str:
-    """Return a valid OAuth access token, refreshing if needed.
-    Returns empty string if token.json is missing or invalid."""
+
+def _run_auth_flow() -> None:
+    """Runs the OAuth flow in a background thread, opens the browser, saves token.json."""
+    global _auth_error
+    try:
+        flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_PATH, SCOPES)
+        creds = flow.run_local_server(port=AUTH_PORT, open_browser=True)
+        with open(TOKEN_PATH, "w") as f:
+            f.write(creds.to_json())
+        logger.info("Gmail auth completed — token.json saved.")
+    except Exception as e:
+        _auth_error = str(e)
+        logger.error(f"Gmail auth failed: {e}")
+    finally:
+        _auth_done.set()
+
+
+def _get_valid_credentials() -> Optional[Credentials]:
+    """Load valid credentials from token.json, refreshing if expired. Returns None if missing."""
     if not os.path.exists(TOKEN_PATH):
-        logger.warning(
-            "token.json not found. Run:  python3.11 property_management_agent/login.py"
-        )
-        return ""
+        return None
     try:
         creds = Credentials.from_authorized_user_file(TOKEN_PATH, SCOPES)
-        if not creds.valid:
-            if creds.expired and creds.refresh_token:
-                logger.info("Refreshing Gmail OAuth token...")
-                creds.refresh(Request())
-                with open(TOKEN_PATH, "w") as f:
-                    f.write(creds.to_json())
-            else:
-                logger.warning(
-                    "Gmail token invalid. Run:  python3.11 property_management_agent/login.py"
-                )
-                return ""
-        return creds.token
+        if creds.valid:
+            return creds
+        if creds.expired and creds.refresh_token:
+            logger.info("Refreshing Gmail OAuth token...")
+            creds.refresh(Request())
+            with open(TOKEN_PATH, "w") as f:
+                f.write(creds.to_json())
+            return creds
     except Exception as e:
-        logger.warning(f"Could not load Gmail token: {e}")
-        return ""
+        logger.warning(f"Error loading credentials: {e}")
+    return None
+
+
+def _ensure_authenticated() -> tuple[Optional[str], Optional[str]]:
+    """Return (token, user_message). If token is None, user_message tells the
+    user what to do (browser opened, sign-in in progress, etc.)."""
+    global _auth_thread, _auth_error
+
+    creds = _get_valid_credentials()
+    if creds is not None:
+        return creds.token, None
+
+    # No valid token — need to authenticate
+    if not os.path.exists(CREDENTIALS_PATH):
+        return None, (
+            f"Gmail authentication required but credentials-web.json is missing.\n"
+            f"Place your OAuth client JSON at: {CREDENTIALS_PATH}"
+        )
+
+    # Previous auth attempt failed — reset and allow retry
+    if _auth_done.is_set() and _auth_error:
+        err = _auth_error
+        _auth_thread = None
+        _auth_done.clear()
+        _auth_error = None
+        return None, (
+            f"Gmail authentication failed: {err}\n"
+            "Please ask me again to retry — a new browser window will open."
+        )
+
+    # Auth still in progress
+    if _auth_thread is not None and _auth_thread.is_alive():
+        return None, (
+            "Gmail sign-in is in progress. Please complete the sign-in in the "
+            "browser window that opened, then ask me again to continue."
+        )
+
+    # Start a fresh auth flow — opens the browser automatically
+    _auth_done.clear()
+    _auth_error = None
+    _auth_thread = threading.Thread(target=_run_auth_flow, daemon=True)
+    _auth_thread.start()
+    return None, (
+        "Gmail authentication required. A browser window has just been opened "
+        "for you to sign in to your Google account. Please grant the requested "
+        "permissions, then ask me again to fetch your emails."
+    )
 
 
 # ── Gmail MCP JSON-RPC client ──────────────────────────────────────────────────
@@ -76,10 +139,12 @@ def _load_access_token() -> str:
 # task-management bugs with ADK, so we bypass them and speak JSON-RPC ourselves.
 
 def _mcp_call(tool_name: str, arguments: dict) -> dict:
-    """Invoke a Gmail MCP tool via JSON-RPC over HTTP. Returns the parsed result dict."""
-    token = _load_access_token()
-    if not token:
-        return {"isError": True, "error": "Not authenticated. Run login.py first."}
+    """Invoke a Gmail MCP tool via JSON-RPC over HTTP. Returns the parsed result dict.
+    If the user isn't authenticated, kicks off an interactive OAuth flow and
+    returns a user-facing message that the agent can relay verbatim."""
+    token, user_message = _ensure_authenticated()
+    if token is None:
+        return {"isError": True, "needsAuth": True, "message": user_message}
     payload = {
         "jsonrpc": "2.0",
         "id": 1,
@@ -458,6 +523,14 @@ RULES
 - Employees = anyone with a @<domain> email address.
 - Key contacts = external people (tenants, landlords, contractors).
 - If current vs previous manager is ambiguous, mark as "current" and note it.
+
+AUTHENTICATION HANDLING
+- If a Gmail tool returns {"needsAuth": true, "message": "..."}, this means
+  the user is not signed in to Google. STOP the workflow and reply with the
+  exact text from the "message" field. Do not retry, do not try other tools,
+  do not apologise — just relay the message so the user sees what to do.
+- After the user completes sign-in and asks again, retry the workflow from
+  the start.
 """,
     tools=[
         search_threads,
