@@ -3,10 +3,11 @@ Property Management Email Analyzer — root agent.
 
 Architecture:
   root_agent (property_email_analyzer)
-  │  Gmail MCP tools  → https://gmailmcp.googleapis.com/mcp/v1  (JSON-RPC over httpx)
-  │    • search_threads(query, page_size, page_token)
-  │    • get_thread(thread_id, message_format)
-  │  (Direct httpx calls — MCP Python SDK transports have async bugs with ADK)
+  │  Gmail tools  → Gmail REST API via googleapiclient
+  │    • search_threads(query, page_size)
+  │    • get_thread(thread_id)
+  │  (Same OAuth flow as the Gmail MCP path; bypasses the gmailmcp.googleapis.com
+  │   developer-preview gate by talking to the standard Gmail API directly.)
   │  Python extraction tools (deterministic regex helpers)
   │    • extract_employees_from_text
   │    • extract_managers_from_text
@@ -16,6 +17,7 @@ Architecture:
   │
   └─ AgentTool → database_agent (manages SQLite via direct Python functions)
 """
+import base64
 import json
 import logging
 import os
@@ -24,12 +26,13 @@ import sys
 import threading
 from typing import Optional
 
-import httpx
 from google.adk.agents import Agent
 from google.adk.tools.agent_tool import AgentTool
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
 from .database_agent.agent import database_agent
 
@@ -39,14 +42,9 @@ logger = logging.getLogger(__name__)
 AGENT_DIR = os.path.dirname(os.path.abspath(__file__))
 TOKEN_PATH = os.path.join(AGENT_DIR, "token.json")
 CREDENTIALS_PATH = os.path.join(AGENT_DIR, "credentials-web.json")
-GMAIL_MCP_URL = "https://gmailmcp.googleapis.com/mcp/v1"
 AUTH_PORT = 8080  # OAuth callback port — must match a redirect URI registered
                   # in your Google Cloud OAuth client (credentials-web.json).
-                  # 8080 is the one already registered for this project.
-SCOPES = [
-    "https://www.googleapis.com/auth/gmail.readonly",
-    "https://www.googleapis.com/auth/gmail.compose",
-]
+SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
 
 # ── Auth state (shared between background thread and callers) ─────────────────
 _auth_thread: Optional[threading.Thread] = None
@@ -135,109 +133,123 @@ def _ensure_authenticated() -> tuple[Optional[str], Optional[str]]:
     )
 
 
-# ── Gmail MCP JSON-RPC client ──────────────────────────────────────────────────
-# Calls the official Google Gmail MCP server (gmailmcp.googleapis.com) directly
-# via httpx. The MCP Python SDK transports (Streamable HTTP, SSE) have async
-# task-management bugs with ADK, so we bypass them and speak JSON-RPC ourselves.
+# ── Gmail REST API client (via googleapiclient) ───────────────────────────────
+# Uses the standard Gmail API (gmail.googleapis.com), not the Gmail MCP server.
+# Same OAuth token, no developer-preview gating.
 
-def _mcp_call(tool_name: str, arguments: dict) -> dict:
-    """Invoke a Gmail MCP tool via JSON-RPC over HTTP. Returns the parsed result dict.
-    If the user isn't authenticated, kicks off an interactive OAuth flow and
-    returns a user-facing message that the agent can relay verbatim."""
+def _get_gmail_service():
+    """Build a Gmail API service object using the user's OAuth credentials.
+    Returns (service, error_dict_or_None). If error_dict is set, surface it
+    to the user instead of using the service."""
     token, user_message = _ensure_authenticated()
     if token is None:
-        return {"isError": True, "needsAuth": True, "message": user_message}
-    payload = {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "tools/call",
-        "params": {"name": tool_name, "arguments": arguments},
-    }
+        return None, {"isError": True, "needsAuth": True, "message": user_message}
     try:
-        resp = httpx.post(
-            GMAIL_MCP_URL,
-            json=payload,
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-            },
-            timeout=60.0,
-        )
-        # Log full response body for diagnostic purposes (especially auth/scope issues)
-        if resp.status_code >= 400 or "Forbidden" in resp.reason_phrase:
-            logger.error(
-                f"Gmail MCP error: HTTP {resp.status_code} {resp.reason_phrase}\n"
-                f"Response body: {resp.text[:500]}"
-            )
-            return {
-                "isError": True,
-                "message": f"Gmail MCP server returned {resp.status_code} {resp.reason_phrase}: {resp.text[:300]}",
-            }
-        data = resp.json()
-        if "error" in data:
-            return {"isError": True, "error": data["error"]}
-        return data.get("result", {})
-    except httpx.HTTPError as e:
-        return {"isError": True, "error": f"HTTP error: {e}"}
+        creds = _get_valid_credentials()
+        return build("gmail", "v1", credentials=creds, cache_discovery=False), None
+    except Exception as e:
+        return None, {"isError": True, "message": f"Could not build Gmail service: {e}"}
 
 
-def search_threads(query: str = "", page_size: int = 20, page_token: str = "") -> str:
+def _decode_body(part: dict) -> str:
+    """Recursively walk a Gmail message payload to extract plain-text body."""
+    mime = part.get("mimeType", "")
+    body_data = part.get("body", {}).get("data")
+    if mime == "text/plain" and body_data:
+        try:
+            return base64.urlsafe_b64decode(body_data).decode("utf-8", errors="replace")
+        except Exception:
+            return ""
+    # Prefer text/plain in subparts; fall back to first text/html stripped.
+    text_plain = ""
+    text_html = ""
+    for sub in part.get("parts", []) or []:
+        sub_mime = sub.get("mimeType", "")
+        if sub_mime == "text/plain":
+            text_plain = text_plain or _decode_body(sub)
+        elif sub_mime == "text/html":
+            text_html = text_html or _decode_body(sub)
+        elif sub_mime.startswith("multipart/"):
+            inner = _decode_body(sub)
+            if inner:
+                text_plain = text_plain or inner
+    if text_plain:
+        return text_plain
+    if text_html and not body_data:
+        return re.sub(r"<[^>]+>", " ", text_html)
+    if mime == "text/html" and body_data:
+        raw = base64.urlsafe_b64decode(body_data).decode("utf-8", errors="replace")
+        return re.sub(r"<[^>]+>", " ", raw)
+    return ""
+
+
+def search_threads(query: str = "", page_size: int = 20) -> str:
     """
-    Search Gmail threads using the official Gmail MCP server.
+    Search Gmail threads using the standard Gmail REST API.
     Use Gmail search syntax in the query, e.g. "from:@acme-property.com".
 
     Args:
         query: Gmail search query string (Gmail syntax).
-        page_size: Max threads to return (default 20, max 50).
-        page_token: Optional token to fetch next page of results.
+        page_size: Max threads to return (default 20, max 100).
 
     Returns:
-        JSON string with thread list. Each thread has an id and snippet.
+        JSON string with {"threads": [{"id": "...", "snippet": "..."}, ...]}.
     """
-    args: dict = {"query": query, "pageSize": max(1, min(page_size, 50))}
-    if page_token:
-        args["pageToken"] = page_token
-    result = _mcp_call("search_threads", args)
-    if result.get("isError"):
-        return json.dumps(result)
-    # Unwrap MCP content[].text → parsed JSON when possible
-    content = result.get("content", [])
-    if content and content[0].get("type") == "text":
-        text = content[0].get("text", "")
-        try:
-            return json.dumps(json.loads(text))
-        except json.JSONDecodeError:
-            return json.dumps({"raw": text})
-    return json.dumps(result)
+    service, err = _get_gmail_service()
+    if err:
+        return json.dumps(err)
+    try:
+        result = (
+            service.users()
+            .threads()
+            .list(userId="me", q=query, maxResults=max(1, min(page_size, 100)))
+            .execute()
+        )
+        threads = result.get("threads", [])
+        return json.dumps({
+            "count": len(threads),
+            "threads": [{"id": t["id"], "snippet": t.get("snippet", "")} for t in threads],
+        })
+    except HttpError as e:
+        return json.dumps({"isError": True, "message": f"Gmail API error: {e}"})
 
 
-def get_thread(thread_id: str, message_format: str = "FULL_CONTENT") -> str:
+def get_thread(thread_id: str) -> str:
     """
-    Fetch the full content of a Gmail thread by its ID, using the official Gmail MCP server.
+    Fetch the full content of a Gmail thread by its ID, using the Gmail REST API.
 
     Args:
         thread_id: The Gmail thread ID (returned by search_threads).
-        message_format: "FULL_CONTENT" (default) or "MINIMAL".
 
     Returns:
-        JSON string with the full thread including all messages (from, to,
-        subject, date, body text).
+        JSON string with {"id": "...", "messages": [{from, to, subject, date, body}, ...]}.
     """
-    result = _mcp_call(
-        "get_thread",
-        {"threadId": thread_id, "messageFormat": message_format},
-    )
-    if result.get("isError"):
-        return json.dumps(result)
-    content = result.get("content", [])
-    if content and content[0].get("type") == "text":
-        text = content[0].get("text", "")
-        try:
-            return json.dumps(json.loads(text))
-        except json.JSONDecodeError:
-            return json.dumps({"raw": text})
-    return json.dumps(result)
+    service, err = _get_gmail_service()
+    if err:
+        return json.dumps(err)
+    try:
+        thread = (
+            service.users()
+            .threads()
+            .get(userId="me", id=thread_id, format="full")
+            .execute()
+        )
+        messages_out = []
+        for msg in thread.get("messages", []):
+            payload = msg.get("payload", {})
+            headers = {h["name"]: h["value"] for h in payload.get("headers", [])}
+            messages_out.append({
+                "id": msg.get("id", ""),
+                "from": headers.get("From", ""),
+                "to": headers.get("To", ""),
+                "cc": headers.get("Cc", ""),
+                "subject": headers.get("Subject", ""),
+                "date": headers.get("Date", ""),
+                "body": _decode_body(payload),
+            })
+        return json.dumps({"id": thread.get("id", thread_id), "messages": messages_out})
+    except HttpError as e:
+        return json.dumps({"isError": True, "message": f"Gmail API error: {e}"})
 
 
 # ── Python extraction helpers (called by the LLM as tools) ────────────────────
