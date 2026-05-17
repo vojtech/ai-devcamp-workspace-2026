@@ -15,7 +15,11 @@ Architecture:
   │    • extract_tasks_from_text
   │    • extract_meetings_from_text
   │
-  └─ AgentTool → database_agent (manages SQLite via direct Python functions)
+  ├─ AgentTool → classifier_agent  (LLM that tags each email into JSON)
+  ├─ AgentTool → drive_agent       (finds files in a dedicated Drive folder)
+  └─ AgentTool → database_agent    (manages SQLite via direct Python functions)
+
+OAuth (shared across all sub-agents) lives in _auth.py.
 """
 import base64
 import json
@@ -23,115 +27,19 @@ import logging
 import os
 import re
 import sys
-import threading
-from typing import Optional
 
 from google.adk.agents import Agent
 from google.adk.tools.agent_tool import AgentTool
-from google.auth.transport.requests import Request
-from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
+from ._auth import get_credentials_or_message
 from .classifier_agent.agent import classifier_agent
 from .database_agent.agent import database_agent
+from .drive_agent.agent import drive_agent
 
 logging.basicConfig(stream=sys.stderr, level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-AGENT_DIR = os.path.dirname(os.path.abspath(__file__))
-TOKEN_PATH = os.path.join(AGENT_DIR, "token.json")
-CREDENTIALS_PATH = os.path.join(AGENT_DIR, "credentials-web.json")
-AUTH_PORT = 8080  # OAuth callback port — must match a redirect URI registered
-                  # in your Google Cloud OAuth client (credentials-web.json).
-SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
-
-# ── Auth state (shared between background thread and callers) ─────────────────
-_auth_thread: Optional[threading.Thread] = None
-_auth_done = threading.Event()
-_auth_error: Optional[str] = None
-
-
-def _run_auth_flow() -> None:
-    """Runs the OAuth flow in a background thread, opens the browser, saves token.json."""
-    global _auth_error
-    try:
-        flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_PATH, SCOPES)
-        creds = flow.run_local_server(port=AUTH_PORT, open_browser=True)
-        with open(TOKEN_PATH, "w") as f:
-            f.write(creds.to_json())
-        logger.info("Gmail auth completed — token.json saved.")
-    except Exception as e:
-        _auth_error = str(e)
-        logger.error(f"Gmail auth failed: {e}")
-    finally:
-        _auth_done.set()
-
-
-def _get_valid_credentials() -> Optional[Credentials]:
-    """Load valid credentials from token.json, refreshing if expired. Returns None if missing."""
-    if not os.path.exists(TOKEN_PATH):
-        return None
-    try:
-        creds = Credentials.from_authorized_user_file(TOKEN_PATH, SCOPES)
-        if creds.valid:
-            return creds
-        if creds.expired and creds.refresh_token:
-            logger.info("Refreshing Gmail OAuth token...")
-            creds.refresh(Request())
-            with open(TOKEN_PATH, "w") as f:
-                f.write(creds.to_json())
-            return creds
-    except Exception as e:
-        logger.warning(f"Error loading credentials: {e}")
-    return None
-
-
-def _ensure_authenticated() -> tuple[Optional[str], Optional[str]]:
-    """Return (token, user_message). If token is None, user_message tells the
-    user what to do (browser opened, sign-in in progress, etc.)."""
-    global _auth_thread, _auth_error
-
-    creds = _get_valid_credentials()
-    if creds is not None:
-        return creds.token, None
-
-    # No valid token — need to authenticate
-    if not os.path.exists(CREDENTIALS_PATH):
-        return None, (
-            f"Gmail authentication required but credentials-web.json is missing.\n"
-            f"Place your OAuth client JSON at: {CREDENTIALS_PATH}"
-        )
-
-    # Previous auth attempt failed — reset and allow retry
-    if _auth_done.is_set() and _auth_error:
-        err = _auth_error
-        _auth_thread = None
-        _auth_done.clear()
-        _auth_error = None
-        return None, (
-            f"Gmail authentication failed: {err}\n"
-            "Please ask me again to retry — a new browser window will open."
-        )
-
-    # Auth still in progress
-    if _auth_thread is not None and _auth_thread.is_alive():
-        return None, (
-            "Gmail sign-in is in progress. Please complete the sign-in in the "
-            "browser window that opened, then ask me again to continue."
-        )
-
-    # Start a fresh auth flow — opens the browser automatically
-    _auth_done.clear()
-    _auth_error = None
-    _auth_thread = threading.Thread(target=_run_auth_flow, daemon=True)
-    _auth_thread.start()
-    return None, (
-        "Gmail authentication required. A browser window has just been opened "
-        "for you to sign in to your Google account. Please grant the requested "
-        "permissions, then ask me again to fetch your emails."
-    )
 
 
 # ── Gmail REST API client (via googleapiclient) ───────────────────────────────
@@ -142,11 +50,10 @@ def _get_gmail_service():
     """Build a Gmail API service object using the user's OAuth credentials.
     Returns (service, error_dict_or_None). If error_dict is set, surface it
     to the user instead of using the service."""
-    token, user_message = _ensure_authenticated()
-    if token is None:
+    creds, user_message = get_credentials_or_message()
+    if creds is None:
         return None, {"isError": True, "needsAuth": True, "message": user_message}
     try:
-        creds = _get_valid_credentials()
         return build("gmail", "v1", credentials=creds, cache_discovery=False), None
     except Exception as e:
         return None, {"isError": True, "message": f"Could not build Gmail service: {e}"}
@@ -463,6 +370,7 @@ def extract_meetings_from_text(text: str, source_email: str = "") -> str:
 
 db_tool = AgentTool(agent=database_agent)
 classifier_tool = AgentTool(agent=classifier_agent)
+drive_tool = AgentTool(agent=drive_agent)
 
 root_agent = Agent(
     name="property_email_analyzer",
@@ -509,6 +417,17 @@ D) CLASSIFIED-EMAIL BROWSING  (filter previously-analysed emails by flags)
      "How many emails per category?"
    → Delegate to database_agent (list_email_classifications with filters,
      or classification_counts for aggregates). Do NOT re-fetch from Gmail.
+
+E) DRIVE FILE LOOKUP  (find a document in the dedicated Drive folder)
+   Examples:
+     "Find the lease for unit 12B"
+     "Where is the maintenance contract?"
+     "Get me the link to the meeting minutes from March"
+     "What files are in the Drive folder?"
+     "Show me the inspection report"
+   → Delegate to drive_agent. It searches the configured DRIVE_FOLDER_ID /
+     DRIVE_FOLDER_NAME and returns webViewLink URLs for matching files.
+     Pass the user's distinctive search terms as the `query` argument.
 
 ═══════════════════════════════════════════
 FREEFORM Q&A WORKFLOW
@@ -660,6 +579,7 @@ AUTHENTICATION HANDLING
         extract_tasks_from_text,
         extract_meetings_from_text,
         classifier_tool,
+        drive_tool,
         db_tool,
     ],
 )
