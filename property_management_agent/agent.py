@@ -3,9 +3,10 @@ Property Management Email Analyzer — root agent.
 
 Architecture:
   root_agent (property_email_analyzer)
-  │  Gmail MCP tools  → https://gmailmcp.googleapis.com/mcp/v1  (Bearer OAuth)
-  │    • search_threads(query, max_results)
-  │    • get_thread(thread_id)
+  │  Gmail MCP tools  → https://gmailmcp.googleapis.com/mcp/v1  (JSON-RPC over httpx)
+  │    • search_threads(query, page_size, page_token)
+  │    • get_thread(thread_id, message_format)
+  │  (Direct httpx calls — MCP Python SDK transports have async bugs with ADK)
   │  Python extraction tools (deterministic regex helpers)
   │    • extract_employees_from_text
   │    • extract_managers_from_text
@@ -22,9 +23,9 @@ import re
 import sys
 from typing import Optional
 
+import httpx
 from google.adk.agents import Agent
 from google.adk.tools.agent_tool import AgentTool
-from google.adk.tools.mcp_tool import McpToolset, StreamableHTTPConnectionParams
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 
@@ -44,12 +45,10 @@ SCOPES = [
 
 def _load_access_token() -> str:
     """Return a valid OAuth access token, refreshing if needed.
-    Returns empty string if token.json is missing so the module can still
-    import cleanly — Gmail MCP calls will fail at runtime with an auth error."""
+    Returns empty string if token.json is missing or invalid."""
     if not os.path.exists(TOKEN_PATH):
         logger.warning(
-            "token.json not found. Gmail tools will not work until you authenticate.\n"
-            "Run:  python3.11 property_management_agent/login.py"
+            "token.json not found. Run:  python3.11 property_management_agent/login.py"
         )
         return ""
     try:
@@ -71,13 +70,98 @@ def _load_access_token() -> str:
         return ""
 
 
-# ── Gmail MCP toolset (official Google server) ─────────────────────────────────
-gmail_tools = McpToolset(
-    connection_params=StreamableHTTPConnectionParams(
-        url=GMAIL_MCP_URL,
-        headers={"Authorization": f"Bearer {_load_access_token()}"},
+# ── Gmail MCP JSON-RPC client ──────────────────────────────────────────────────
+# Calls the official Google Gmail MCP server (gmailmcp.googleapis.com) directly
+# via httpx. The MCP Python SDK transports (Streamable HTTP, SSE) have async
+# task-management bugs with ADK, so we bypass them and speak JSON-RPC ourselves.
+
+def _mcp_call(tool_name: str, arguments: dict) -> dict:
+    """Invoke a Gmail MCP tool via JSON-RPC over HTTP. Returns the parsed result dict."""
+    token = _load_access_token()
+    if not token:
+        return {"isError": True, "error": "Not authenticated. Run login.py first."}
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {"name": tool_name, "arguments": arguments},
+    }
+    try:
+        resp = httpx.post(
+            GMAIL_MCP_URL,
+            json=payload,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            },
+            timeout=60.0,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if "error" in data:
+            return {"isError": True, "error": data["error"]}
+        return data.get("result", {})
+    except httpx.HTTPError as e:
+        return {"isError": True, "error": f"HTTP error: {e}"}
+
+
+def search_threads(query: str = "", page_size: int = 20, page_token: str = "") -> str:
+    """
+    Search Gmail threads using the official Gmail MCP server.
+    Use Gmail search syntax in the query, e.g. "from:@acme-property.com".
+
+    Args:
+        query: Gmail search query string (Gmail syntax).
+        page_size: Max threads to return (default 20, max 50).
+        page_token: Optional token to fetch next page of results.
+
+    Returns:
+        JSON string with thread list. Each thread has an id and snippet.
+    """
+    args: dict = {"query": query, "pageSize": max(1, min(page_size, 50))}
+    if page_token:
+        args["pageToken"] = page_token
+    result = _mcp_call("search_threads", args)
+    if result.get("isError"):
+        return json.dumps(result)
+    # Unwrap MCP content[].text → parsed JSON when possible
+    content = result.get("content", [])
+    if content and content[0].get("type") == "text":
+        text = content[0].get("text", "")
+        try:
+            return json.dumps(json.loads(text))
+        except json.JSONDecodeError:
+            return json.dumps({"raw": text})
+    return json.dumps(result)
+
+
+def get_thread(thread_id: str, message_format: str = "FULL_CONTENT") -> str:
+    """
+    Fetch the full content of a Gmail thread by its ID, using the official Gmail MCP server.
+
+    Args:
+        thread_id: The Gmail thread ID (returned by search_threads).
+        message_format: "FULL_CONTENT" (default) or "MINIMAL".
+
+    Returns:
+        JSON string with the full thread including all messages (from, to,
+        subject, date, body text).
+    """
+    result = _mcp_call(
+        "get_thread",
+        {"threadId": thread_id, "messageFormat": message_format},
     )
-)
+    if result.get("isError"):
+        return json.dumps(result)
+    content = result.get("content", [])
+    if content and content[0].get("type") == "text":
+        text = content[0].get("text", "")
+        try:
+            return json.dumps(json.loads(text))
+        except json.JSONDecodeError:
+            return json.dumps({"raw": text})
+    return json.dumps(result)
 
 
 # ── Python extraction helpers (called by the LLM as tools) ────────────────────
@@ -376,7 +460,8 @@ RULES
 - If current vs previous manager is ambiguous, mark as "current" and note it.
 """,
     tools=[
-        gmail_tools,
+        search_threads,
+        get_thread,
         extract_employees_from_text,
         extract_managers_from_text,
         extract_contacts_from_text,
