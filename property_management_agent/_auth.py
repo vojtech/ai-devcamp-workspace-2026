@@ -1,28 +1,26 @@
 """
-Shared OAuth machinery for the property_management_agent package.
+Shared Google auth machinery for the property_management_agent package.
 
-Both the Gmail tools (in agent.py) and the Drive tools (in drive_agent/)
-need a valid Google OAuth token, so the credential loading + interactive
-browser-based sign-in flow lives here as a single source of truth.
+Two distinct credential paths:
 
-Key behaviours:
-  - SCOPES is the UNION of every scope any sub-agent in this package needs
-    (currently Gmail readonly + Drive readonly). When a new sub-agent needs
-    a new scope, add it here.
-  - If the on-disk token.json was issued for a STRICT SUBSET of SCOPES
-    (e.g. user authenticated before Drive was added), we treat the token as
-    invalid and force a re-auth so the user grants the extra scopes.
-  - All actual API calls (`_ensure_authenticated`) return a (token, message)
-    tuple — when token is None, message is a user-facing string the agent
-    relays verbatim ("browser opened, please sign in").
+  1. USER OAuth  (Gmail) — agent.py uses this. Interactive browser sign-in,
+     full mailbox read access.
+
+  2. SERVICE ACCOUNT  (Drive) — drive_agent uses this. NOT linked to the
+     user's Google account; can only see folders that have been explicitly
+     shared with the service account's email. This gives folder-scoped
+     access without granting the agent full Drive permissions.
+
+Keeping the two paths separate means a Drive misconfiguration can't leak
+into Gmail (and vice versa).
 """
 import logging
 import os
-import sys
 import threading
 from typing import Optional
 
 from google.auth.transport.requests import Request
+from google.oauth2 import service_account
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 
@@ -34,11 +32,20 @@ CREDENTIALS_PATH = os.path.join(PACKAGE_DIR, "credentials-web.json")
 AUTH_PORT = 8080  # OAuth callback — must match a redirect URI registered
                   # in your Google Cloud OAuth client.
 
-# Union of every scope any sub-agent in this package needs.
+# OAuth scopes — Gmail only. Drive uses a service account (see below).
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",
-    "https://www.googleapis.com/auth/drive.readonly",
 ]
+
+# Service-account credentials for Drive — the JSON key file path can be set
+# via DRIVE_SERVICE_ACCOUNT_JSON, defaulting to service-account.json next
+# to this file. Drive read scope is requested but the service account's
+# actual visibility is limited to folders explicitly shared with its email.
+SERVICE_ACCOUNT_JSON_PATH = os.getenv(
+    "DRIVE_SERVICE_ACCOUNT_JSON",
+    os.path.join(PACKAGE_DIR, "service-account.json"),
+)
+DRIVE_SA_SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 
 # Shared auth state (one auth flow at a time, across all threads)
 _auth_thread: Optional[threading.Thread] = None
@@ -135,8 +142,8 @@ def ensure_authenticated() -> tuple[Optional[str], Optional[str]]:
     _auth_thread.start()
     return None, (
         "Google authentication required. A browser window has just been "
-        "opened — please sign in and grant the requested permissions "
-        "(Gmail + Drive read access), then ask me again."
+        "opened — please sign in and grant the requested permissions, "
+        "then ask me again."
     )
 
 
@@ -148,3 +155,33 @@ def get_credentials_or_message() -> tuple[Optional[Credentials], Optional[str]]:
     if token is None:
         return None, msg
     return _get_valid_credentials(), None
+
+
+# ── Drive service-account credentials ──────────────────────────────────────────
+# Folder-scoped Drive access: the service account can only see folders that
+# have been explicitly shared with its email address. NOT linked to the user.
+
+def get_drive_credentials() -> tuple[Optional[service_account.Credentials], Optional[str]]:
+    """Load Drive service-account credentials.
+    Returns (creds, error_message). error_message is set when the JSON key
+    file is missing or invalid — surface it verbatim to the user."""
+    if not os.path.exists(SERVICE_ACCOUNT_JSON_PATH):
+        return None, (
+            "Drive service-account key not found at:\n"
+            f"  {SERVICE_ACCOUNT_JSON_PATH}\n\n"
+            "To set it up:\n"
+            "1. Create a service account at "
+            "https://console.cloud.google.com/iam-admin/serviceaccounts\n"
+            "2. Download its JSON key and save it at the path above\n"
+            "3. Share the Drive folders you want the agent to access with "
+            "the service account's email address (Viewer permission)\n"
+            "4. Set DRIVE_FOLDERS in .env to the IDs of those folders\n"
+            "Then ask me again."
+        )
+    try:
+        creds = service_account.Credentials.from_service_account_file(
+            SERVICE_ACCOUNT_JSON_PATH, scopes=DRIVE_SA_SCOPES
+        )
+        return creds, None
+    except Exception as e:
+        return None, f"Could not load service-account key: {e}"
