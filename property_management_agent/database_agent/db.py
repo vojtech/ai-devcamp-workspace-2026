@@ -161,7 +161,18 @@ def init_db() -> None:
                 ingested_at     DATETIME DEFAULT CURRENT_TIMESTAMP
             );
             CREATE INDEX IF NOT EXISTS idx_archive_thread ON email_archive(thread_id);
+            CREATE INDEX IF NOT EXISTS idx_archive_drive_file ON email_archive(drive_file_id);
         """)
+        # Idempotent migrations on email_archive — silently no-op if the
+        # column already exists. Used so DBs created before incremental sync
+        # was added pick up the new column without manual intervention.
+        for ddl in (
+            "ALTER TABLE email_archive ADD COLUMN drive_modified_time TEXT DEFAULT ''",
+        ):
+            try:
+                conn.execute(ddl)
+            except sqlite3.OperationalError:
+                pass  # column already exists
         # sqlite-vec virtual table can only be created via a single statement
         # (executescript chokes on the USING vec0(...) clause in some sqlite
         # builds), so run it on its own.
@@ -682,12 +693,14 @@ def save_email_archive_entry(
     participants: str = "",
     web_view_link: str = "",
     message_count: int = 0,
+    drive_modified_time: str = "",
 ) -> str:
     """Insert (or update) an email-thread archive entry and its embedding.
 
     Idempotent on thread_id — re-ingesting the same thread replaces the body
-    + embedding rather than creating a duplicate. The returned string is a
-    short status the agent can relay verbatim.
+    + embedding rather than creating a duplicate. drive_modified_time is
+    stored so subsequent ingest runs can skip files that haven't changed in
+    Drive since the last sync.
     """
     if len(embedding) != VECTOR_DIM:
         return json.dumps({
@@ -705,11 +718,13 @@ def save_email_archive_entry(
                 UPDATE email_archive
                 SET drive_file_id=?, file_name=?, subject=?, snippet=?,
                     body_text=?, message_count=?, participants=?,
-                    web_view_link=?, ingested_at=CURRENT_TIMESTAMP
+                    web_view_link=?, drive_modified_time=?,
+                    ingested_at=CURRENT_TIMESTAMP
                 WHERE id=?
             """, (
                 drive_file_id, file_name, subject, snippet, body_text,
-                message_count, participants, web_view_link, row_id,
+                message_count, participants, web_view_link,
+                drive_modified_time, row_id,
             ))
             # Replace the vector row
             if _HAS_VEC:
@@ -723,11 +738,13 @@ def save_email_archive_entry(
         cur = conn.execute("""
             INSERT INTO email_archive
                 (thread_id, drive_file_id, file_name, subject, snippet,
-                 body_text, message_count, participants, web_view_link)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 body_text, message_count, participants, web_view_link,
+                 drive_modified_time)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             thread_id, drive_file_id, file_name, subject, snippet,
             body_text, message_count, participants, web_view_link,
+            drive_modified_time,
         ))
         row_id = cur.lastrowid
         if _HAS_VEC:
