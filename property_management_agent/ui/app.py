@@ -88,6 +88,68 @@ def render_classification_tags(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+@st.cache_data(ttl=30)
+def fetch_archive_row(thread_id: str, _cache_buster: int = 0) -> dict | None:
+    """Return the full email_archive row (incl. body_text) for a thread_id."""
+    if not thread_id or not os.path.exists(DB_PATH):
+        return None
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        try:
+            r = conn.execute(
+                "SELECT * FROM email_archive WHERE thread_id=?", (thread_id,)
+            ).fetchone()
+            return dict(r) if r else None
+        except sqlite3.OperationalError:
+            return None
+
+
+def render_thread_detail(row: dict, key_prefix: str = "") -> None:
+    """Render the full message body + metadata for one archive row inside a
+    bordered container. Used by both the search results and the
+    'All indexed threads' expander."""
+    if not row:
+        return
+    with st.container(border=True):
+        # Header block: subject + open-in-Drive button
+        head_a, head_b = st.columns([4, 1])
+        with head_a:
+            st.markdown(f"### {row.get('subject') or '(no subject)'}")
+            meta_bits = []
+            if row.get("participants"):
+                meta_bits.append(f"**Participants:** {row['participants']}")
+            if row.get("message_count"):
+                meta_bits.append(f"**Messages:** {row['message_count']}")
+            if row.get("drive_modified_time"):
+                meta_bits.append(f"**Drive modified:** {row['drive_modified_time']}")
+            if row.get("ingested_at"):
+                meta_bits.append(f"**Ingested:** {row['ingested_at']}")
+            if meta_bits:
+                st.caption(" · ".join(meta_bits))
+        with head_b:
+            if row.get("web_view_link"):
+                st.link_button("🔗 Open in Drive", row["web_view_link"])
+
+        # Full body. body_text was assembled in _parse_thread_json with one
+        # "[date | From: ...]" header per message followed by the body, so
+        # we render it with hard line-breaks preserved via st.text.
+        body = row.get("body_text", "") or ""
+        if body:
+            view_mode = st.radio(
+                "View",
+                options=["📜 Preview (first 500 chars)", "📄 Full message"],
+                horizontal=True,
+                key=f"{key_prefix}view_mode",
+                label_visibility="collapsed",
+            )
+            if view_mode.startswith("📜"):
+                st.text(body[:500] + ("…" if len(body) > 500 else ""))
+            else:
+                st.text(body)
+        else:
+            st.info("(no body text stored for this thread)")
+
+
 # ── Page setup ──────────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="Property Management Browser",
@@ -259,10 +321,17 @@ with tab_search:
                         "subject", "similarity", "category", "urgency", "requires_action",
                         "participants", "snippet", "web_view_link", "thread_id",
                     ) if c in res_df.columns]
-                    st.dataframe(
+                    st.caption(
+                        "👉 Click any row to read the full message below "
+                        "(or click 🔗 to open the original JSON in Drive)."
+                    )
+                    event = st.dataframe(
                         res_df[show_cols],
                         use_container_width=True,
                         hide_index=True,
+                        on_select="rerun",
+                        selection_mode="single-row",
+                        key="search_results_table",
                         column_config={
                             "web_view_link": st.column_config.LinkColumn(
                                 "Open in Drive", display_text="🔗 open"
@@ -274,6 +343,16 @@ with tab_search:
                             "participants": st.column_config.TextColumn("participants", width="medium"),
                         },
                     )
+                    selected_rows = (
+                        event.selection.rows
+                        if event and getattr(event, "selection", None)
+                        else []
+                    )
+                    if selected_rows:
+                        sel_tid = res_df.iloc[selected_rows[0]].get("thread_id")
+                        if sel_tid:
+                            full_row = fetch_archive_row(sel_tid, cb)
+                            render_thread_detail(full_row or {}, key_prefix="srch_")
         else:
             st.caption(
                 f"Type a query above. Currently **{len(archive_df)}** "
@@ -281,24 +360,39 @@ with tab_search:
             )
 
         with st.expander(f"📂 All {len(archive_df)} indexed threads", expanded=False):
+            st.caption("Click any row to read its full message.")
             # Show a sortable browse view of every ingested thread
             list_cols = [c for c in (
                 "subject", "participants", "message_count",
                 "ingested_at", "drive_modified_time", "web_view_link", "thread_id",
             ) if c in archive_df.columns]
-            st.dataframe(
-                archive_df[list_cols].sort_values(
-                    by="ingested_at" if "ingested_at" in archive_df.columns else "subject",
-                    ascending=False,
-                ),
+            browse_df = archive_df[list_cols].sort_values(
+                by="ingested_at" if "ingested_at" in archive_df.columns else "subject",
+                ascending=False,
+            ).reset_index(drop=True)
+            event = st.dataframe(
+                browse_df,
                 use_container_width=True,
                 hide_index=True,
+                on_select="rerun",
+                selection_mode="single-row",
+                key="archive_browse_table",
                 column_config={
                     "web_view_link": st.column_config.LinkColumn(
                         "Open", display_text="🔗"
                     ),
                 },
             )
+            sel_rows = (
+                event.selection.rows
+                if event and getattr(event, "selection", None)
+                else []
+            )
+            if sel_rows:
+                sel_tid = browse_df.iloc[sel_rows[0]].get("thread_id")
+                if sel_tid:
+                    full_row = fetch_archive_row(sel_tid, cb)
+                    render_thread_detail(full_row or {}, key_prefix="browse_")
 
 
 # ── Email Classifications ──────────────────────────────────────────────────────
