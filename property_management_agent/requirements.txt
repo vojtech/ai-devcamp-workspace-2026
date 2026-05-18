@@ -4,6 +4,8 @@ google-auth-oauthlib>=1.0.0
 google-api-python-client>=2.0.0
 httpx>=0.27.0
 mcp>=1.0.0
+# Vector search over the email archive (sqlite-vec + Gemini embeddings)
+sqlite-vec>=0.1.6
 # UI (optional — install only if you want to run the Streamlit data browser)
 streamlit>=1.30.0
 pandas>=2.0.0

@@ -3,10 +3,25 @@ SQLite schema and CRUD helpers used directly by the database_agent tools.
 DB_PATH defaults to property_data.db next to this file, or from DB_PATH env var.
 """
 import json
+import logging
 import os
 import sqlite3
+import struct
 from datetime import datetime
-from typing import Any
+from typing import Any, Optional
+
+logger = logging.getLogger(__name__)
+
+# sqlite-vec is optional — the rest of the DB layer must keep working even
+# if the extension can't load (e.g. on a system where the sqlite3 build
+# doesn't allow load_extension). Archive search will return a graceful
+# error in that case, but everything else (tasks, contacts, etc.) still works.
+try:
+    import sqlite_vec
+    _HAS_VEC = True
+except ImportError:  # pragma: no cover
+    _HAS_VEC = False
+    logger.warning("sqlite-vec not installed — email_archive vector search disabled.")
 
 # Resolve DB_PATH so a relative value from .env (e.g. DB_PATH=property_data.db)
 # is interpreted relative to the property_management_agent package dir, NOT the
@@ -21,10 +36,30 @@ DB_PATH = (
 )
 
 
+# Constant matching property_management_agent._embeddings.EMBEDDING_DIM.
+# Hardcoded here so db.py doesn't reach across packages for an import cycle.
+VECTOR_DIM = 768
+
+
 def get_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
+    # Load sqlite-vec on every connection so vec0 tables are queryable.
+    # Soft-fail: if extension loading isn't supported on this platform we
+    # just lose archive search; everything else still works.
+    if _HAS_VEC:
+        try:
+            conn.enable_load_extension(True)
+            sqlite_vec.load(conn)
+            conn.enable_load_extension(False)
+        except (AttributeError, sqlite3.OperationalError) as e:
+            logger.warning(f"Could not load sqlite-vec on this connection: {e}")
     return conn
+
+
+def _serialize_vec(vec: list[float]) -> bytes:
+    """sqlite-vec expects vectors as raw float32 little-endian bytes."""
+    return struct.pack(f"{len(vec)}f", *vec)
 
 
 def init_db() -> None:
@@ -109,7 +144,35 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_class_category ON email_classifications(category);
             CREATE INDEX IF NOT EXISTS idx_class_urgency  ON email_classifications(urgency);
             CREATE INDEX IF NOT EXISTS idx_class_action   ON email_classifications(requires_action);
+
+            -- Raw email-thread archive ingested from the Drive 'emails' folder.
+            -- One row per thread; companion vec0 table holds the embedding.
+            CREATE TABLE IF NOT EXISTS email_archive (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                thread_id       TEXT UNIQUE NOT NULL,
+                drive_file_id   TEXT NOT NULL,
+                file_name       TEXT NOT NULL,
+                subject         TEXT,
+                snippet         TEXT,
+                body_text       TEXT,
+                message_count   INTEGER DEFAULT 0,
+                participants    TEXT,
+                web_view_link   TEXT,
+                ingested_at     DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_archive_thread ON email_archive(thread_id);
         """)
+        # sqlite-vec virtual table can only be created via a single statement
+        # (executescript chokes on the USING vec0(...) clause in some sqlite
+        # builds), so run it on its own.
+        if _HAS_VEC:
+            try:
+                conn.execute(f"""
+                    CREATE VIRTUAL TABLE IF NOT EXISTS email_archive_vec
+                    USING vec0(embedding float[{VECTOR_DIM}])
+                """)
+            except sqlite3.OperationalError as e:
+                logger.warning(f"Could not create email_archive_vec table: {e}")
 
 
 # ── Role merging ───────────────────────────────────────────────────────────────
@@ -601,3 +664,187 @@ def get_db_summary() -> str:
         ).fetchone()
         data["current_property_manager"] = dict(pm) if pm else None
     return json.dumps(data)
+
+
+# ── Email archive (vector search) ─────────────────────────────────────────────
+# Stores the raw text of each email thread ingested from Drive plus a 768-dim
+# embedding in a companion vec0 virtual table. Searched with sqlite-vec's
+# `embedding MATCH ?` KNN operator and optionally filtered by classification.
+
+def save_email_archive_entry(
+    thread_id: str,
+    drive_file_id: str,
+    file_name: str,
+    embedding: list[float],
+    subject: str = "",
+    snippet: str = "",
+    body_text: str = "",
+    participants: str = "",
+    web_view_link: str = "",
+    message_count: int = 0,
+) -> str:
+    """Insert (or update) an email-thread archive entry and its embedding.
+
+    Idempotent on thread_id — re-ingesting the same thread replaces the body
+    + embedding rather than creating a duplicate. The returned string is a
+    short status the agent can relay verbatim.
+    """
+    if len(embedding) != VECTOR_DIM:
+        return json.dumps({
+            "isError": True,
+            "message": f"Embedding has {len(embedding)} dims; expected {VECTOR_DIM}.",
+        })
+
+    with get_conn() as conn:
+        existing = conn.execute(
+            "SELECT id FROM email_archive WHERE thread_id=?", (thread_id,)
+        ).fetchone()
+        if existing:
+            row_id = existing["id"]
+            conn.execute("""
+                UPDATE email_archive
+                SET drive_file_id=?, file_name=?, subject=?, snippet=?,
+                    body_text=?, message_count=?, participants=?,
+                    web_view_link=?, ingested_at=CURRENT_TIMESTAMP
+                WHERE id=?
+            """, (
+                drive_file_id, file_name, subject, snippet, body_text,
+                message_count, participants, web_view_link, row_id,
+            ))
+            # Replace the vector row
+            if _HAS_VEC:
+                conn.execute("DELETE FROM email_archive_vec WHERE rowid=?", (row_id,))
+                conn.execute(
+                    "INSERT INTO email_archive_vec(rowid, embedding) VALUES (?, ?)",
+                    (row_id, _serialize_vec(embedding)),
+                )
+            return json.dumps({"status": "updated", "thread_id": thread_id, "id": row_id})
+
+        cur = conn.execute("""
+            INSERT INTO email_archive
+                (thread_id, drive_file_id, file_name, subject, snippet,
+                 body_text, message_count, participants, web_view_link)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            thread_id, drive_file_id, file_name, subject, snippet,
+            body_text, message_count, participants, web_view_link,
+        ))
+        row_id = cur.lastrowid
+        if _HAS_VEC:
+            conn.execute(
+                "INSERT INTO email_archive_vec(rowid, embedding) VALUES (?, ?)",
+                (row_id, _serialize_vec(embedding)),
+            )
+    return json.dumps({"status": "inserted", "thread_id": thread_id, "id": row_id})
+
+
+def search_email_archive(
+    query_embedding: list[float],
+    limit: int = 10,
+    category: str = "",
+    urgency: str = "",
+    requires_action: str = "",
+) -> str:
+    """KNN search over archived email threads. Optionally filter by the
+    matching email_classifications row (joined on thread_id).
+
+    Args:
+        query_embedding: 768-dim embedding of the user's query text.
+        limit: Max results (default 10, max 50).
+        category / urgency / requires_action: optional filters; "" = no filter.
+
+    Returns:
+        JSON: {"count": N, "results": [
+            {id, thread_id, subject, snippet, participants, web_view_link,
+             distance, category, urgency, requires_action}, ...
+        ]} ordered by ascending distance (closest first).
+    """
+    if not _HAS_VEC:
+        return json.dumps({
+            "isError": True,
+            "message": "sqlite-vec is not installed — archive search unavailable.",
+        })
+    if len(query_embedding) != VECTOR_DIM:
+        return json.dumps({
+            "isError": True,
+            "message": f"Query embedding has {len(query_embedding)} dims; expected {VECTOR_DIM}.",
+        })
+
+    n = max(1, min(int(limit) if str(limit).isdigit() else 10, 50))
+    # Over-fetch from vec table so we still have N matches after the optional
+    # classification filter. 4× is enough for typical filter selectivity.
+    knn = n * 4 if (category or urgency or requires_action) else n
+
+    where_extra: list[str] = []
+    params_extra: list[Any] = []
+    if category:
+        where_extra.append("c.category = ?"); params_extra.append(category)
+    if urgency:
+        where_extra.append("c.urgency = ?"); params_extra.append(urgency)
+    if requires_action.lower() in ("true", "false"):
+        where_extra.append("c.requires_action = ?")
+        params_extra.append(1 if requires_action.lower() == "true" else 0)
+
+    extra_join = "LEFT JOIN email_classifications c ON c.thread_id = a.thread_id"
+    extra_filter = (" AND " + " AND ".join(where_extra)) if where_extra else ""
+
+    sql = f"""
+        WITH knn AS (
+            SELECT rowid, distance FROM email_archive_vec
+            WHERE embedding MATCH ?
+            ORDER BY distance
+            LIMIT ?
+        )
+        SELECT a.id, a.thread_id, a.subject, a.snippet, a.participants,
+               a.web_view_link, knn.distance,
+               c.category, c.urgency, c.requires_action
+        FROM knn
+        JOIN email_archive a ON a.id = knn.rowid
+        {extra_join}
+        WHERE 1=1{extra_filter}
+        ORDER BY knn.distance
+        LIMIT ?
+    """
+    params = [_serialize_vec(query_embedding), knn] + params_extra + [n]
+
+    try:
+        with get_conn() as conn:
+            rows = conn.execute(sql, params).fetchall()
+    except sqlite3.OperationalError as e:
+        return json.dumps({"isError": True, "message": f"Archive search failed: {e}"})
+    return json.dumps({
+        "count": len(rows),
+        "results": [dict(r) for r in rows],
+    })
+
+
+def count_email_archive() -> str:
+    """Return the number of ingested threads (and embedded ones, if different)."""
+    with get_conn() as conn:
+        total = conn.execute("SELECT COUNT(*) FROM email_archive").fetchone()[0]
+        embedded = 0
+        if _HAS_VEC:
+            try:
+                embedded = conn.execute(
+                    "SELECT COUNT(*) FROM email_archive_vec"
+                ).fetchone()[0]
+            except sqlite3.OperationalError:
+                pass
+    return json.dumps({
+        "total_threads": total,
+        "embedded_threads": embedded,
+        "vector_search_available": _HAS_VEC,
+    })
+
+
+def list_ingested_threads(limit: int = 50) -> str:
+    """List archived email threads (id, subject, participants, ingested_at).
+    Useful for the UI / debugging — search uses search_email_archive instead."""
+    n = max(1, min(int(limit) if str(limit).isdigit() else 50, 500))
+    with get_conn() as conn:
+        rows = conn.execute("""
+            SELECT id, thread_id, subject, snippet, participants,
+                   message_count, web_view_link, ingested_at
+            FROM email_archive ORDER BY ingested_at DESC LIMIT ?
+        """, (n,)).fetchall()
+    return json.dumps([dict(r) for r in rows], default=str)
