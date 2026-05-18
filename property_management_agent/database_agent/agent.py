@@ -20,6 +20,10 @@ from .db import (
     list_email_classifications,
     get_email_classification,
     classification_counts,
+    save_email_archive_entry,
+    search_email_archive,
+    count_email_archive,
+    list_ingested_threads,
     get_db_summary,
 )
 
@@ -105,6 +109,10 @@ Rules:
         list_email_classifications,
         get_email_classification,
         classification_counts,
+        save_email_archive_entry,
+        search_email_archive,
+        count_email_archive,
+        list_ingested_threads,
         get_db_summary,
     ],
 )

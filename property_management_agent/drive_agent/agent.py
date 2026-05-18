@@ -21,6 +21,7 @@ Configuration (.env):
   folder", "list attachments"). If the user doesn't set labels, every
   folder is searchable but only by id.
 """
+import io
 import json
 import logging
 import os
@@ -29,6 +30,7 @@ from typing import Optional
 from google.adk.agents import Agent
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+from googleapiclient.http import MediaIoBaseDownload
 
 from .._auth import get_drive_credentials
 
@@ -243,6 +245,74 @@ def get_file_link(file_id: str) -> str:
         return json.dumps({"isError": True, "message": f"Drive API error: {e}"})
 
 
+def download_drive_file_content(file_id: str, max_bytes: int = 5_000_000) -> str:
+    """
+    Download the raw text content of a Drive file (e.g. a JSON email thread).
+
+    Args:
+        file_id: Drive file id (from find_file_in_folder).
+        max_bytes: Refuse files larger than this (default 5 MB) — guards
+                   against accidentally pulling huge binaries.
+
+    Returns:
+        JSON: {"file_id": "...", "name": "...", "mimeType": "...",
+               "size_bytes": N, "content": "<decoded text>"}.
+        On error: {"isError": true, "message": "..."}.
+
+    Only works for text-like files (JSON, plain text). Google Docs / Sheets /
+    binary attachments return an error — use get_file_link for those.
+    """
+    service, err = _drive_service()
+    if err:
+        return json.dumps(err)
+    try:
+        meta = (
+            service.files()
+            .get(
+                fileId=file_id,
+                fields="id, name, mimeType, size, webViewLink",
+                supportsAllDrives=True,
+            )
+            .execute()
+        )
+        size = int(meta.get("size", 0) or 0)
+        if size > max_bytes:
+            return json.dumps({
+                "isError": True,
+                "message": f"File '{meta.get('name')}' is {size} bytes (limit {max_bytes}).",
+            })
+        mime = meta.get("mimeType", "")
+        if mime.startswith("application/vnd.google-apps."):
+            return json.dumps({
+                "isError": True,
+                "message": (
+                    f"'{meta.get('name')}' is a Google-native doc ({mime}). "
+                    "Use get_file_link instead, or export it to text/JSON first."
+                ),
+            })
+
+        req = service.files().get_media(fileId=file_id, supportsAllDrives=True)
+        buf = io.BytesIO()
+        downloader = MediaIoBaseDownload(buf, req, chunksize=1024 * 1024)
+        done = False
+        while not done:
+            _, done = downloader.next_chunk()
+        raw = buf.getvalue()
+        try:
+            content = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            content = raw.decode("utf-8", errors="replace")
+        return json.dumps({
+            "file_id": meta["id"],
+            "name": meta.get("name", ""),
+            "mimeType": mime,
+            "size_bytes": len(raw),
+            "content": content,
+        })
+    except HttpError as e:
+        return json.dumps({"isError": True, "message": f"Drive API error: {e}"})
+
+
 # ── Agent definition ───────────────────────────────────────────────────────────
 
 drive_agent = Agent(
@@ -280,6 +350,11 @@ TOOLS
   get_file_link(file_id)
     Fetch metadata + webViewLink for a known file id.
 
+  download_drive_file_content(file_id, max_bytes=5000000)
+    Download the raw text content of a file (JSON, plain text). Used by
+    the archive-ingestion workflow to read email-thread JSONs into the DB.
+    NOT for binary attachments or Google-native docs — use get_file_link.
+
 WORKFLOW
 
 - The user has TWO labeled folders configured by default:
@@ -309,5 +384,6 @@ WORKFLOW
         find_file_in_folder,
         list_folder,
         get_file_link,
+        download_drive_file_content,
     ],
 )

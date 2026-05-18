@@ -366,6 +366,219 @@ def extract_meetings_from_text(text: str, source_email: str = "") -> str:
     return json.dumps([meeting])
 
 
+# ── Email archive (vector RAG over Drive JSON threads) ───────────────────────
+# Single Python function that does the whole ingestion loop. The LLM just
+# calls this once to backfill the archive — we don't want it issuing one
+# tool call per email for hundreds of files.
+
+from ._embeddings import embed_for_query, embed_for_storage  # noqa: E402
+from .database_agent.db import (  # noqa: E402
+    save_email_archive_entry,
+    search_email_archive as _db_search_email_archive,
+    count_email_archive,
+)
+from .drive_agent.agent import (  # noqa: E402
+    download_drive_file_content as _download_drive_file_content,
+    list_folder as _drive_list_folder,
+)
+
+
+def _parse_thread_json(raw: str) -> dict:
+    """Parse an exported Gmail thread JSON (the format you're storing in
+    the Drive 'emails' folder) into the fields the archive needs.
+
+    Schema (input):
+      {threadId, subject, messageCount, messages: [
+        {messageId, from, to, cc, date, body, attachments?: [
+          {filename, mimeType, sizeBytes}
+        ]}
+      ]}
+
+    Returns:
+      {thread_id, subject, snippet, body_text, message_count, participants}
+      — empty strings / 0 where fields are missing. body_text is the
+      concatenation of every message body, prefixed with a one-line header
+      so the embedding can pick up dates and senders as semantic signal.
+    """
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return {
+            "thread_id": "", "subject": "", "snippet": raw[:200].strip(),
+            "body_text": raw, "message_count": 1, "participants": "",
+        }
+    if not isinstance(data, dict):
+        return {
+            "thread_id": "", "subject": "", "snippet": "",
+            "body_text": raw, "message_count": 1, "participants": "",
+        }
+
+    thread_id = str(data.get("threadId") or "").strip()
+    subject = str(data.get("subject") or "").strip()
+    msg_count_field = data.get("messageCount")
+    messages = data.get("messages") if isinstance(data.get("messages"), list) else []
+
+    participants: set[str] = set()
+    blocks: list[str] = []
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        sender = str(m.get("from") or "").strip()
+        date = str(m.get("date") or "").strip()
+        body = str(m.get("body") or "").strip()
+        if sender:
+            participants.add(sender)
+        # Prefix each message with a small header so date/sender become part
+        # of the embedded text (otherwise "what did X say last March" can't
+        # match without metadata in the body).
+        header_bits = [b for b in (date, f"From: {sender}" if sender else "") if b]
+        header = " | ".join(header_bits)
+        if header and body:
+            blocks.append(f"[{header}]\n{body}")
+        elif body:
+            blocks.append(body)
+
+    body_text = "\n\n---\n\n".join(blocks)
+    snippet = (body_text.replace("\n", " ").strip())[:200]
+
+    return {
+        "thread_id": thread_id,
+        "subject": subject,
+        "snippet": snippet,
+        "body_text": body_text,
+        "message_count": int(msg_count_field) if isinstance(msg_count_field, int) else len(messages),
+        "participants": ", ".join(sorted(participants)),
+    }
+
+
+def ingest_email_archive_from_drive(limit: int = 0, force_reembed: bool = False) -> str:
+    """
+    Ingest every JSON file from the Drive 'emails' folder into the local
+    email_archive table — downloading, parsing, embedding, and storing
+    each thread. Idempotent: re-running skips threads that were already
+    embedded (unless force_reembed=True).
+
+    Args:
+        limit: Max files to process this run (0 = no limit). Use a small
+               number first time to validate before backfilling everything.
+        force_reembed: If True, re-embed and overwrite existing entries.
+
+    Returns:
+        JSON summary: {ingested, skipped, errors, files_processed, errors_detail}.
+    """
+    listing_raw = _drive_list_folder("emails", limit=500)
+    listing = json.loads(listing_raw)
+    if listing.get("isError"):
+        return json.dumps(listing)
+    files = [f for f in listing.get("files", [])
+             if f.get("name", "").endswith(".json")]
+    if limit and limit > 0:
+        files = files[:limit]
+
+    # Pre-fetch what's already ingested to skip cleanly
+    existing_summary = json.loads(count_email_archive())
+    already_have: set[str] = set()
+    if not force_reembed:
+        with __import__("sqlite3").connect(
+            __import__("property_management_agent.database_agent.db", fromlist=["DB_PATH"]).DB_PATH
+        ) as c:
+            already_have = {r[0] for r in c.execute("SELECT thread_id FROM email_archive").fetchall()}
+
+    ingested = 0
+    skipped = 0
+    errors: list[dict] = []
+    for f in files:
+        file_id = f["id"]
+        name = f.get("name", "")
+        try:
+            dl_raw = _download_drive_file_content(file_id)
+            dl = json.loads(dl_raw)
+            if dl.get("isError"):
+                errors.append({"file": name, "error": dl.get("message", "download failed")})
+                continue
+            parsed = _parse_thread_json(dl.get("content", ""))
+            # Canonical thread_id from the JSON itself; fall back to file_id
+            thread_id = parsed["thread_id"] or file_id
+            if thread_id in already_have and not force_reembed:
+                skipped += 1
+                continue
+            if not parsed["body_text"].strip():
+                errors.append({"file": name, "error": "empty body after parse"})
+                continue
+            embedding = embed_for_storage(parsed["body_text"])
+            save_result_raw = save_email_archive_entry(
+                thread_id=thread_id,
+                drive_file_id=file_id,
+                file_name=name,
+                embedding=embedding,
+                subject=parsed["subject"],
+                snippet=parsed["snippet"],
+                body_text=parsed["body_text"],
+                participants=parsed["participants"],
+                web_view_link=f.get("webViewLink", ""),
+                message_count=parsed["message_count"],
+            )
+            save_result = json.loads(save_result_raw)
+            if save_result.get("isError"):
+                errors.append({"file": name, "error": save_result.get("message", "save failed")})
+                continue
+            ingested += 1
+        except Exception as e:
+            errors.append({"file": name, "error": f"{type(e).__name__}: {e}"})
+
+    return json.dumps({
+        "files_processed": len(files),
+        "ingested": ingested,
+        "skipped": skipped,
+        "errors": len(errors),
+        "errors_detail": errors[:10],  # cap to avoid blowing up the response
+        "now_in_archive": json.loads(count_email_archive()),
+    })
+
+
+def search_email_archive(
+    query: str,
+    category: str = "",
+    urgency: str = "",
+    requires_action: str = "",
+    limit: int = 10,
+) -> str:
+    """
+    Semantic search over the ingested email archive. Embeds the query and
+    runs KNN against the email_archive_vec table, optionally filtered by
+    classification (category / urgency / requires_action).
+
+    Args:
+        query: Natural-language question or keyword phrase.
+        category: One of maintenance/billing/leasing/legal/handover/complaint/
+                  emergency/administrative/communication/other. "" = no filter.
+        urgency: low/normal/high/urgent. "" = no filter.
+        requires_action: "true" / "false" / "" (no filter).
+        limit: Max results (default 10, max 50).
+
+    Returns:
+        JSON: {"count": N, "results": [{thread_id, subject, snippet,
+            participants, web_view_link, distance, category, urgency,
+            requires_action}, ...]} ordered by similarity (lowest distance first).
+    """
+    if not query or not query.strip():
+        return json.dumps({"isError": True, "message": "query is empty"})
+    try:
+        qv = embed_for_query(query)
+    except Exception as e:
+        return json.dumps({
+            "isError": True,
+            "message": f"Failed to embed query (check GOOGLE_API_KEY): {e}",
+        })
+    return _db_search_email_archive(
+        query_embedding=qv,
+        limit=limit,
+        category=category,
+        urgency=urgency,
+        requires_action=requires_action,
+    )
+
+
 # ── Root agent ─────────────────────────────────────────────────────────────────
 
 db_tool = AgentTool(agent=database_agent)
@@ -428,6 +641,22 @@ E) DRIVE FILE LOOKUP  (find a document in the dedicated Drive folder)
    → Delegate to drive_agent. It searches the configured DRIVE_FOLDER_ID /
      DRIVE_FOLDER_NAME and returns webViewLink URLs for matching files.
      Pass the user's distinctive search terms as the `query` argument.
+
+F) ARCHIVE SEARCH  (semantic search across past email threads)
+   Examples:
+     "What did we say about the boiler last month?"
+     "Find conversations about lease renewals"
+     "When did the tenant first complain about heating?"
+     "Search past emails for water damage"
+     "Any threads mentioning the new contractor?"
+   → Call the local tool `search_email_archive(query, category="",
+     urgency="", limit=10)` directly. It embeds the query and does a
+     vector search over the ingested email-thread JSON files. Returns
+     each match with subject, snippet, participants, distance score, and
+     a Drive webViewLink so the user can open the full thread.
+   → First time the user asks for archive search and the archive is
+     empty, call `ingest_email_archive_from_drive()` to backfill from
+     the Drive emails folder, then run the search.
 
 ═══════════════════════════════════════════
 FREEFORM Q&A WORKFLOW
@@ -578,6 +807,8 @@ AUTHENTICATION HANDLING
         extract_contacts_from_text,
         extract_tasks_from_text,
         extract_meetings_from_text,
+        ingest_email_archive_from_drive,
+        search_email_archive,
         classifier_tool,
         drive_tool,
         db_tool,
