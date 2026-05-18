@@ -1,25 +1,44 @@
 """
-Streamlit UI for browsing the property management SQLite database.
+Streamlit UI for browsing the property management SQLite database AND
+running semantic search against the embedded email archive.
 
 Run from the project root:
     streamlit run property_management_agent/ui/app.py
 
-Reads the same property_data.db the ADK agents write to. Read-only — no
-edits or deletes — to keep the agent the single source of truth for writes.
+Reads the same property_data.db the ADK agents write to. Read-only on the
+table browser side. The Email-archive search tab also calls embed_for_query
+(Gemini API) and the sqlite-vec KNN search, but never writes new rows on
+its own — ingestion happens via the agent or the cron CLI.
 """
 import json
 import os
 import sqlite3
+import sys
 from pathlib import Path
 
 import pandas as pd
 import streamlit as st
 
+# ── Bootstrap ─────────────────────────────────────────────────────────────────
+# Make the property_management_agent package importable when streamlit is
+# invoked from anywhere (e.g. from /Users/.../DevCamp via `streamlit run ...`).
+_AGENT_DIR = Path(__file__).resolve().parent.parent
+_REPO_ROOT = _AGENT_DIR.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+# Load .env so GOOGLE_API_KEY (and DRIVE_FOLDERS, DB_PATH, etc.) reach the
+# embedding helper. Streamlit does not auto-load .env.
+try:
+    from dotenv import load_dotenv  # type: ignore
+    load_dotenv(_AGENT_DIR / ".env")
+except ImportError:
+    pass
+
 # ── DB location ─────────────────────────────────────────────────────────────────
 # Use the exact same resolution logic the agent's db.py applies, so the UI
 # always points at the file the agent is actually writing to — even when the
 # user sets DB_PATH (relative or absolute) in .env.
-_AGENT_DIR = Path(__file__).resolve().parent.parent
 _RAW = os.getenv("DB_PATH") or "property_data.db"
 DB_PATH = _RAW if os.path.isabs(_RAW) else os.path.normpath(str(_AGENT_DIR / _RAW))
 
@@ -96,9 +115,37 @@ if st.sidebar.button("🔄 Refresh data"):
 
 cb = st.session_state.cache_buster
 
+# ── Sidebar: archive sync ──────────────────────────────────────────────────────
+# Lets the user trigger an incremental sync from Drive without opening adk web.
+# Lazy-imports the heavy agent module so the UI loads instantly otherwise.
+
+with st.sidebar:
+    st.divider()
+    st.subheader("Email archive")
+    if st.button("⬇️  Sync from Drive"):
+        with st.spinner("Syncing archive from Drive..."):
+            try:
+                from property_management_agent.agent import ingest_email_archive_from_drive
+                report = json.loads(ingest_email_archive_from_drive())
+                st.success(
+                    f"Synced — new={report.get('new', 0)}, "
+                    f"updated={report.get('updated', 0)}, "
+                    f"skipped={report.get('skipped_unchanged', 0)}, "
+                    f"errors={report.get('errors', 0)}"
+                )
+                st.cache_data.clear()
+                st.session_state.cache_buster += 1
+            except Exception as e:
+                st.error(f"Sync failed: {type(e).__name__}: {e}")
+    st.caption(
+        "Pulls new / updated email-thread JSONs from the Drive folder and "
+        "embeds them. Files unchanged since the last sync are skipped."
+    )
+
+
 # ── Summary header ──────────────────────────────────────────────────────────────
 def summary_metrics():
-    cols = st.columns(6)
+    cols = st.columns(7)
     counts = {
         "Employees":        len(load_table("employees", cb)),
         "Managers":         len(load_table("property_managers", cb)),
@@ -106,6 +153,7 @@ def summary_metrics():
         "Tasks":            len(load_table("tasks", cb)),
         "Meetings":         len(load_table("meetings", cb)),
         "Classifications":  len(load_table("email_classifications", cb)),
+        "Archive (RAG)":    len(load_table("email_archive", cb)),
     }
     for col, (label, n) in zip(cols, counts.items()):
         col.metric(label, n)
@@ -115,7 +163,8 @@ summary_metrics()
 st.divider()
 
 # ── Tabs ────────────────────────────────────────────────────────────────────────
-tab_class, tab_emp, tab_mgr, tab_con, tab_task, tab_meet = st.tabs([
+tab_search, tab_class, tab_emp, tab_mgr, tab_con, tab_task, tab_meet = st.tabs([
+    "🔎 Email archive search",
     "📨 Email classifications",
     "👥 Employees",
     "🧑‍💼 Property managers",
@@ -123,6 +172,133 @@ tab_class, tab_emp, tab_mgr, tab_con, tab_task, tab_meet = st.tabs([
     "✅ Tasks",
     "📅 Meetings",
 ])
+
+
+# ── Email Archive Search (semantic / RAG) ──────────────────────────────────────
+with tab_search:
+    st.subheader("Semantic search across the email archive")
+    st.caption(
+        "Embeds your query with `gemini-embedding-001` and runs KNN against "
+        "the local `email_archive_vec` table. Combine with the classification "
+        "filters for sharper results (e.g. 'urgent maintenance about heating')."
+    )
+
+    archive_df = load_table("email_archive", cb)
+    if archive_df.empty:
+        st.info(
+            "No emails ingested yet. Click **⬇ Sync from Drive** in the "
+            "sidebar to backfill the archive, or run "
+            "`python3.11 -m property_management_agent.sync_archive`."
+        )
+    else:
+        # Query + filter row
+        q = st.text_input(
+            "Search",
+            placeholder="e.g. boiler problem in winter, lease renewal Mitchell Street, urgent maintenance",
+            key="archive_query",
+        )
+        c1, c2, c3, c4 = st.columns(4)
+        class_df = load_table("email_classifications", cb)
+        cat_options = ["All"] + (
+            sorted(class_df["category"].dropna().unique().tolist())
+            if "category" in class_df.columns else []
+        )
+        category = c1.selectbox("Category", options=cat_options, key="srch_cat")
+        urgency = c2.selectbox("Urgency", options=["All", "urgent", "high", "normal", "low"], key="srch_urg")
+        action = c3.selectbox("Requires action", options=["All", "Yes", "No"], key="srch_act")
+        limit = c4.number_input("Max results", min_value=1, max_value=50, value=10, key="srch_lim")
+
+        if q.strip():
+            try:
+                from property_management_agent._embeddings import embed_for_query
+                from property_management_agent.database_agent.db import (
+                    search_email_archive as _db_search_email_archive,
+                )
+            except Exception as e:
+                st.error(f"Could not load search backend: {e}")
+                st.stop()
+
+            with st.spinner("Embedding query and searching..."):
+                try:
+                    qv = embed_for_query(q)
+                except Exception as e:
+                    st.error(
+                        f"Failed to embed query: {e}\n\n"
+                        "Check that GOOGLE_API_KEY is set in "
+                        "`property_management_agent/.env`."
+                    )
+                    st.stop()
+                result_raw = _db_search_email_archive(
+                    query_embedding=qv,
+                    limit=int(limit),
+                    category="" if category == "All" else category,
+                    urgency="" if urgency == "All" else urgency,
+                    requires_action=(
+                        "true" if action == "Yes"
+                        else "false" if action == "No"
+                        else ""
+                    ),
+                )
+            result = json.loads(result_raw)
+            if result.get("isError"):
+                st.error(result.get("message", "Search failed."))
+            else:
+                hits = result.get("results", [])
+                st.caption(f"**{len(hits)}** match(es). Lower distance = closer match.")
+                if hits:
+                    res_df = pd.DataFrame(hits)
+                    # Render similarity column (1 - distance, clamped 0..1)
+                    if "distance" in res_df.columns:
+                        res_df["similarity"] = (1.0 - res_df["distance"]).clip(0, 1)
+                    # Boolean-ish requires_action → label
+                    if "requires_action" in res_df.columns:
+                        res_df["requires_action"] = res_df["requires_action"].map(
+                            lambda v: "Yes" if v in (1, "1", True, "true") else "No" if v in (0, "0", False, "false") else ""
+                        )
+                    show_cols = [c for c in (
+                        "subject", "similarity", "category", "urgency", "requires_action",
+                        "participants", "snippet", "web_view_link", "thread_id",
+                    ) if c in res_df.columns]
+                    st.dataframe(
+                        res_df[show_cols],
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            "web_view_link": st.column_config.LinkColumn(
+                                "Open in Drive", display_text="🔗 open"
+                            ),
+                            "similarity": st.column_config.ProgressColumn(
+                                "similarity", min_value=0.0, max_value=1.0, format="%.2f"
+                            ),
+                            "snippet":      st.column_config.TextColumn("snippet", width="large"),
+                            "participants": st.column_config.TextColumn("participants", width="medium"),
+                        },
+                    )
+        else:
+            st.caption(
+                f"Type a query above. Currently **{len(archive_df)}** "
+                f"email thread(s) are indexed."
+            )
+
+        with st.expander(f"📂 All {len(archive_df)} indexed threads", expanded=False):
+            # Show a sortable browse view of every ingested thread
+            list_cols = [c for c in (
+                "subject", "participants", "message_count",
+                "ingested_at", "drive_modified_time", "web_view_link", "thread_id",
+            ) if c in archive_df.columns]
+            st.dataframe(
+                archive_df[list_cols].sort_values(
+                    by="ingested_at" if "ingested_at" in archive_df.columns else "subject",
+                    ascending=False,
+                ),
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "web_view_link": st.column_config.LinkColumn(
+                        "Open", display_text="🔗"
+                    ),
+                },
+            )
 
 
 # ── Email Classifications ──────────────────────────────────────────────────────
