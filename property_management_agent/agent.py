@@ -453,18 +453,33 @@ def _parse_thread_json(raw: str) -> dict:
 
 def ingest_email_archive_from_drive(limit: int = 0, force_reembed: bool = False) -> str:
     """
-    Ingest every JSON file from the Drive 'emails' folder into the local
-    email_archive table — downloading, parsing, embedding, and storing
-    each thread. Idempotent: re-running skips threads that were already
-    embedded (unless force_reembed=True).
+    Incrementally sync the email archive from the Drive 'emails' folder.
+
+    On every call:
+      - lists the Drive folder (one API call),
+      - looks up each file by its Drive file_id in the local DB,
+      - decides whether to (a) skip unchanged files, (b) ingest brand-new
+        files, or (c) re-embed files whose Drive modifiedTime is newer than
+        what's stored locally (i.e. a new reply was added to an existing
+        thread and the export pipeline re-wrote the JSON).
 
     Args:
-        limit: Max files to process this run (0 = no limit). Use a small
-               number first time to validate before backfilling everything.
-        force_reembed: If True, re-embed and overwrite existing entries.
+        limit: Max files to process this run (0 = no limit). Useful for
+               smoke tests; on a steady-state schedule, leave at 0.
+        force_reembed: If True, re-embed and overwrite ALL files regardless
+                       of modifiedTime. Use only when the embedding model
+                       changes or you want a clean rebuild.
 
     Returns:
-        JSON summary: {ingested, skipped, errors, files_processed, errors_detail}.
+        JSON summary: {
+            "files_processed": N,
+            "new":              N,   # files not previously in the archive
+            "updated":          N,   # files whose Drive mtime was newer
+            "skipped_unchanged":N,   # files already up-to-date in the DB
+            "errors":           N,
+            "errors_detail":    [...],
+            "now_in_archive":   {total_threads, embedded_threads, ...}
+        }
     """
     listing_raw = _drive_list_folder("emails", limit=500)
     listing = json.loads(listing_raw)
@@ -475,21 +490,39 @@ def ingest_email_archive_from_drive(limit: int = 0, force_reembed: bool = False)
     if limit and limit > 0:
         files = files[:limit]
 
-    # Pre-fetch what's already ingested to skip cleanly
-    existing_summary = json.loads(count_email_archive())
-    already_have: set[str] = set()
-    if not force_reembed:
-        with __import__("sqlite3").connect(
-            __import__("property_management_agent.database_agent.db", fromlist=["DB_PATH"]).DB_PATH
-        ) as c:
-            already_have = {r[0] for r in c.execute("SELECT thread_id FROM email_archive").fetchall()}
+    # Build a (drive_file_id -> drive_modified_time) map of what's stored,
+    # so we can decide per-file: skip / ingest-new / update.
+    # Indexing by drive_file_id (Drive's immutable id) is more reliable than
+    # thread_id because Drive may re-export under a new filename/path while
+    # keeping the same file_id, or change the file_id when the export tool
+    # re-creates the file.
+    seen: dict[str, str] = {}
+    from .database_agent.db import get_conn as _db_conn
+    with _db_conn() as c:
+        for r in c.execute(
+            "SELECT drive_file_id, drive_modified_time FROM email_archive"
+        ).fetchall():
+            seen[r["drive_file_id"]] = r["drive_modified_time"] or ""
 
-    ingested = 0
-    skipped = 0
+    new_count = 0
+    updated_count = 0
+    skipped_unchanged = 0
     errors: list[dict] = []
+
     for f in files:
         file_id = f["id"]
         name = f.get("name", "")
+        drive_mtime = f.get("modifiedTime", "") or ""
+
+        stored_mtime = seen.get(file_id)
+        is_new = stored_mtime is None
+        # ISO 8601 timestamps with Z suffix sort lexicographically — safe
+        # to compare with `>=`. Empty stored mtime is treated as stale.
+        if not force_reembed and not is_new:
+            if stored_mtime and drive_mtime and stored_mtime >= drive_mtime:
+                skipped_unchanged += 1
+                continue
+
         try:
             dl_raw = _download_drive_file_content(file_id)
             dl = json.loads(dl_raw)
@@ -497,11 +530,7 @@ def ingest_email_archive_from_drive(limit: int = 0, force_reembed: bool = False)
                 errors.append({"file": name, "error": dl.get("message", "download failed")})
                 continue
             parsed = _parse_thread_json(dl.get("content", ""))
-            # Canonical thread_id from the JSON itself; fall back to file_id
             thread_id = parsed["thread_id"] or file_id
-            if thread_id in already_have and not force_reembed:
-                skipped += 1
-                continue
             if not parsed["body_text"].strip():
                 errors.append({"file": name, "error": "empty body after parse"})
                 continue
@@ -517,21 +546,26 @@ def ingest_email_archive_from_drive(limit: int = 0, force_reembed: bool = False)
                 participants=parsed["participants"],
                 web_view_link=f.get("webViewLink", ""),
                 message_count=parsed["message_count"],
+                drive_modified_time=drive_mtime,
             )
             save_result = json.loads(save_result_raw)
             if save_result.get("isError"):
                 errors.append({"file": name, "error": save_result.get("message", "save failed")})
                 continue
-            ingested += 1
+            if is_new:
+                new_count += 1
+            else:
+                updated_count += 1
         except Exception as e:
             errors.append({"file": name, "error": f"{type(e).__name__}: {e}"})
 
     return json.dumps({
         "files_processed": len(files),
-        "ingested": ingested,
-        "skipped": skipped,
+        "new": new_count,
+        "updated": updated_count,
+        "skipped_unchanged": skipped_unchanged,
         "errors": len(errors),
-        "errors_detail": errors[:10],  # cap to avoid blowing up the response
+        "errors_detail": errors[:10],
         "now_in_archive": json.loads(count_email_archive()),
     })
 
