@@ -613,6 +613,42 @@ def search_email_archive(
     )
 
 
+# ── Optional: run a sync on `adk web` startup ─────────────────────────────────
+# Controlled by AUTO_SYNC_ARCHIVE_ON_STARTUP. Disabled by default — set it to
+# "true" / "1" / "yes" in .env to enable. The sync runs in a daemon thread so
+# it doesn't block agent startup; errors are logged but do not crash the agent.
+
+def _maybe_run_startup_sync() -> None:
+    raw = os.getenv("AUTO_SYNC_ARCHIVE_ON_STARTUP", "").strip().lower()
+    if raw not in ("1", "true", "yes", "on"):
+        return
+
+    import threading
+
+    def _run() -> None:
+        try:
+            logger.info("Auto-sync: starting email archive sync from Drive...")
+            result = json.loads(ingest_email_archive_from_drive())
+            logger.info(
+                "Auto-sync complete: new=%d updated=%d skipped=%d errors=%d",
+                result.get("new", 0),
+                result.get("updated", 0),
+                result.get("skipped_unchanged", 0),
+                result.get("errors", 0),
+            )
+            if result.get("errors", 0) > 0:
+                for e in result.get("errors_detail", [])[:5]:
+                    logger.warning("Auto-sync error: %s — %s",
+                                    e.get("file", "?"), e.get("error", "")[:200])
+        except Exception as e:  # noqa: BLE001
+            logger.error("Auto-sync failed: %s: %s", type(e).__name__, e)
+
+    threading.Thread(target=_run, daemon=True, name="archive_auto_sync").start()
+
+
+_maybe_run_startup_sync()
+
+
 # ── Root agent ─────────────────────────────────────────────────────────────────
 
 db_tool = AgentTool(agent=database_agent)
