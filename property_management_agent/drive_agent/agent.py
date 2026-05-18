@@ -1,17 +1,25 @@
 """
-Drive Agent — finds files in a dedicated Google Drive folder and returns
-shareable links (webViewLink). Used as a sub-agent via AgentTool from the
-root property management agent.
+Drive Agent — finds files in folders explicitly shared with a Google Cloud
+service account, and returns shareable links (webViewLink).
+
+Auth model: SERVICE ACCOUNT (NOT user OAuth).
+The service account can only see folders that have been explicitly shared
+with its email address (`<sa-name>@<project>.iam.gserviceaccount.com`).
+This means the agent has folder-scoped access — not the user's entire
+Drive — even though the OAuth-level scope is `drive.readonly`.
 
 Configuration (.env):
-  DRIVE_FOLDER_ID    — Google Drive folder ID (preferred, faster)
-                        Get it from the folder's URL:
-                          https://drive.google.com/drive/folders/<THIS_IS_THE_ID>
-  DRIVE_FOLDER_NAME  — Or specify by name; the agent resolves it to an ID
-                        on first use. Slower because of the extra lookup.
+  DRIVE_SERVICE_ACCOUNT_JSON  — Path to the SA JSON key.
+                                Defaults to property_management_agent/service-account.json
 
-If neither is set the tools search across the user's entire Drive — usable
-for one-off queries but not what the user asked for.
+  DRIVE_FOLDERS               — Comma-separated list of `label:folder_id`
+                                pairs (or bare ids if you don't need labels).
+                                Example:
+                                    DRIVE_FOLDERS=emails:12iOR49...,attachments:1qtWt5c...
+
+  Labels are how the LLM refers to a specific folder ("search the emails
+  folder", "list attachments"). If the user doesn't set labels, every
+  folder is searchable but only by id.
 """
 import json
 import logging
@@ -22,20 +30,68 @@ from google.adk.agents import Agent
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
-from .._auth import get_credentials_or_message
+from .._auth import get_drive_credentials
 
 logger = logging.getLogger(__name__)
 
-# Read once at import time. If the user changes .env they'll restart anyway.
-DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID", "").strip()
-DRIVE_FOLDER_NAME = os.getenv("DRIVE_FOLDER_NAME", "").strip()
 
-# Cache for name→id resolution so we don't hit Drive on every tool call
-_resolved_folder_id: Optional[str] = None
+# ── Folder configuration ──────────────────────────────────────────────────────
+# Parse DRIVE_FOLDERS once at import. Falls back to legacy DRIVE_FOLDER_ID /
+# DRIVE_FOLDER_NAME if DRIVE_FOLDERS is empty.
+
+def _parse_folder_config() -> dict[str, str]:
+    """Returns {label: folder_id}. Bare ids get auto-labelled folder_N."""
+    raw = os.getenv("DRIVE_FOLDERS", "").strip()
+    out: dict[str, str] = {}
+    if not raw:
+        # Back-compat: honour the old single-folder env vars
+        legacy = os.getenv("DRIVE_FOLDER_ID", "").strip()
+        if legacy:
+            out["default"] = legacy
+        return out
+    for i, part in enumerate(raw.split(",")):
+        part = part.strip()
+        if not part:
+            continue
+        if ":" in part:
+            label, _, folder_id = part.partition(":")
+            label = label.strip().lower()
+            folder_id = folder_id.strip()
+            if label and folder_id:
+                out[label] = folder_id
+        else:
+            out[f"folder_{i+1}"] = part
+    return out
 
 
-def _get_drive_service():
-    creds, msg = get_credentials_or_message()
+FOLDERS: dict[str, str] = _parse_folder_config()
+
+
+def _allowed_folder_ids() -> list[str]:
+    return list(FOLDERS.values())
+
+
+def _resolve_label(folder_label: str = "") -> tuple[list[str], Optional[str]]:
+    """Return ([folder_ids], error). If folder_label is set, restrict to
+    that label only. Otherwise return ALL configured folders."""
+    if folder_label:
+        key = folder_label.strip().lower()
+        if key not in FOLDERS:
+            return [], (
+                f"Unknown folder label '{folder_label}'. "
+                f"Configured labels: {', '.join(FOLDERS) or '(none)'}."
+            )
+        return [FOLDERS[key]], None
+    if not FOLDERS:
+        return [], (
+            "No Drive folders configured. Set DRIVE_FOLDERS in .env to a "
+            "comma-separated list of `label:folder_id` pairs, then restart."
+        )
+    return _allowed_folder_ids(), None
+
+
+def _drive_service():
+    creds, msg = get_drive_credentials()
     if creds is None:
         return None, {"isError": True, "needsAuth": True, "message": msg}
     try:
@@ -44,119 +100,55 @@ def _get_drive_service():
         return None, {"isError": True, "message": f"Could not build Drive service: {e}"}
 
 
-def _resolve_dedicated_folder_id(service) -> tuple[Optional[str], Optional[str]]:
-    """Resolve the configured DRIVE_FOLDER_ID / DRIVE_FOLDER_NAME to an ID.
-    Returns (folder_id, error_message)."""
-    global _resolved_folder_id
-
-    if DRIVE_FOLDER_ID:
-        return DRIVE_FOLDER_ID, None
-
-    if not DRIVE_FOLDER_NAME:
-        return None, None  # neither configured — caller may still search all of Drive
-
-    if _resolved_folder_id:
-        return _resolved_folder_id, None
-
-    try:
-        # Escape single quotes inside the folder name for the Drive query
-        safe = DRIVE_FOLDER_NAME.replace("'", "\\'")
-        results = (
-            service.files()
-            .list(
-                q=f"mimeType='application/vnd.google-apps.folder' "
-                  f"and name='{safe}' and trashed=false",
-                spaces="drive",
-                fields="files(id, name)",
-                pageSize=10,
-            )
-            .execute()
-        )
-        folders = results.get("files", [])
-        if not folders:
-            return None, (
-                f"No folder named '{DRIVE_FOLDER_NAME}' found in your Drive. "
-                f"Set DRIVE_FOLDER_ID in .env to the folder ID instead."
-            )
-        _resolved_folder_id = folders[0]["id"]
-        logger.info(
-            f"Resolved DRIVE_FOLDER_NAME='{DRIVE_FOLDER_NAME}' to id={_resolved_folder_id}"
-        )
-        return _resolved_folder_id, None
-    except HttpError as e:
-        return None, f"Drive API error while resolving folder name: {e}"
+def _in_parents_clause(folder_ids: list[str]) -> str:
+    """Drive query: `'a' in parents or 'b' in parents`."""
+    return "(" + " or ".join(f"'{fid}' in parents" for fid in folder_ids) + ")"
 
 
 # ── Tools ──────────────────────────────────────────────────────────────────────
 
+def list_configured_folders() -> str:
+    """List the folder labels the agent has access to, with their IDs.
+    Use this when the user asks 'what folders can you see?'"""
+    return json.dumps({
+        "count": len(FOLDERS),
+        "folders": [{"label": k, "folder_id": v} for k, v in FOLDERS.items()],
+    })
+
+
 def find_file_in_folder(
     query: str,
-    folder_id: str = "",
-    folder_name: str = "",
+    folder_label: str = "",
     limit: int = 10,
 ) -> str:
     """
-    Find files in a Google Drive folder by name (full-text match).
+    Find files in the configured Drive folders by name (partial match).
 
     Args:
         query: Text to match in the file name (Drive 'contains' semantics).
-        folder_id: Override the configured DRIVE_FOLDER_ID for this call.
-        folder_name: Override the configured DRIVE_FOLDER_NAME for this call.
+        folder_label: Restrict to ONE labeled folder (e.g. "emails",
+                      "attachments"). If empty, searches ALL configured folders.
         limit: Max results to return (default 10, max 50).
 
     Returns:
-        JSON string: {"count": N, "folder_id": "...", "files": [
-            {"id": "...", "name": "...", "mimeType": "...",
-             "webViewLink": "...", "modifiedTime": "..."},
-            ...
+        JSON: {"count": N, "folders_searched": [...], "files": [
+            {id, name, mimeType, webViewLink, modifiedTime, parents}, ...
         ]}
 
-    The webViewLink in each result IS the shareable link — opening it grants
-    whatever access the file already has in Drive (the agent does not change
-    permissions; that requires a broader OAuth scope).
+    webViewLink IS the shareable URL — anyone the file is shared with can
+    open it. The service account does not modify share permissions.
     """
-    service, err = _get_drive_service()
+    service, err = _drive_service()
     if err:
         return json.dumps(err)
 
-    # Determine which folder to search
-    if folder_id:
-        target_id = folder_id
-    elif folder_name:
-        # Caller wants a specific named folder for this query only
-        safe = folder_name.replace("'", "\\'")
-        try:
-            folder_results = (
-                service.files()
-                .list(
-                    q=f"mimeType='application/vnd.google-apps.folder' "
-                      f"and name='{safe}' and trashed=false",
-                    spaces="drive",
-                    fields="files(id, name)",
-                    pageSize=5,
-                )
-                .execute()
-            )
-            folders = folder_results.get("files", [])
-            if not folders:
-                return json.dumps({
-                    "isError": True,
-                    "message": f"No folder named '{folder_name}' found.",
-                })
-            target_id = folders[0]["id"]
-        except HttpError as e:
-            return json.dumps({"isError": True, "message": f"Drive API error: {e}"})
-    else:
-        target_id, folder_err = _resolve_dedicated_folder_id(service)
-        if folder_err:
-            return json.dumps({"isError": True, "message": folder_err})
+    folder_ids, folder_err = _resolve_label(folder_label)
+    if folder_err:
+        return json.dumps({"isError": True, "message": folder_err})
 
-    # Build the file-search query
-    safe_q = (query or "").replace("'", "\\'")
-    parts = ["trashed=false"]
-    if target_id:
-        parts.append(f"'{target_id}' in parents")
-    if safe_q:
+    parts = ["trashed=false", _in_parents_clause(folder_ids)]
+    if query:
+        safe_q = query.replace("'", "\\'")
         parts.append(f"name contains '{safe_q}'")
     drive_q = " and ".join(parts)
 
@@ -169,14 +161,58 @@ def find_file_in_folder(
                 fields="files(id, name, mimeType, webViewLink, modifiedTime, parents)",
                 pageSize=max(1, min(int(limit) if str(limit).isdigit() else 10, 50)),
                 orderBy="modifiedTime desc",
+                # Service account doesn't own the files; we only need 'me'-style
+                # listing when the SA *is* the owner. The next two params ensure
+                # we list shared content correctly:
+                supportsAllDrives=True,
+                includeItemsFromAllDrives=True,
             )
             .execute()
         )
-        files = results.get("files", [])
         return json.dumps({
-            "count": len(files),
-            "folder_id": target_id,
-            "files": files,
+            "count": len(results.get("files", [])),
+            "folders_searched": folder_ids,
+            "files": results.get("files", []),
+        })
+    except HttpError as e:
+        return json.dumps({"isError": True, "message": f"Drive API error: {e}"})
+
+
+def list_folder(folder_label: str = "", limit: int = 50) -> str:
+    """
+    List everything in a labeled folder (or all configured folders), newest
+    first. Useful when the user has no specific filename in mind.
+
+    Args:
+        folder_label: One configured label, or "" for all folders.
+        limit: Max files to return (default 50, max 200).
+    """
+    service, err = _drive_service()
+    if err:
+        return json.dumps(err)
+    folder_ids, folder_err = _resolve_label(folder_label)
+    if folder_err:
+        return json.dumps({"isError": True, "message": folder_err})
+
+    drive_q = f"trashed=false and {_in_parents_clause(folder_ids)}"
+    try:
+        results = (
+            service.files()
+            .list(
+                q=drive_q,
+                spaces="drive",
+                fields="files(id, name, mimeType, webViewLink, modifiedTime, parents)",
+                pageSize=max(1, min(int(limit) if str(limit).isdigit() else 50, 200)),
+                orderBy="modifiedTime desc",
+                supportsAllDrives=True,
+                includeItemsFromAllDrives=True,
+            )
+            .execute()
+        )
+        return json.dumps({
+            "count": len(results.get("files", [])),
+            "folders_listed": folder_ids,
+            "files": results.get("files", []),
         })
     except HttpError as e:
         return json.dumps({"isError": True, "message": f"Drive API error: {e}"})
@@ -184,16 +220,12 @@ def find_file_in_folder(
 
 def get_file_link(file_id: str) -> str:
     """
-    Return the shareable webViewLink for a specific Drive file ID.
+    Return metadata + webViewLink for a specific file id.
 
     Args:
-        file_id: Google Drive file ID (from find_file_in_folder).
-
-    Returns:
-        JSON string: {"id": "...", "name": "...", "webViewLink": "...",
-                      "mimeType": "...", "modifiedTime": "..."}.
+        file_id: Drive file id (from find_file_in_folder or list_folder).
     """
-    service, err = _get_drive_service()
+    service, err = _drive_service()
     if err:
         return json.dumps(err)
     try:
@@ -201,59 +233,12 @@ def get_file_link(file_id: str) -> str:
             service.files()
             .get(
                 fileId=file_id,
-                fields="id, name, mimeType, webViewLink, modifiedTime",
+                fields="id, name, mimeType, webViewLink, modifiedTime, parents",
+                supportsAllDrives=True,
             )
             .execute()
         )
         return json.dumps(meta)
-    except HttpError as e:
-        return json.dumps({"isError": True, "message": f"Drive API error: {e}"})
-
-
-def list_dedicated_folder(limit: int = 50) -> str:
-    """
-    List all files in the dedicated folder (configured via DRIVE_FOLDER_ID
-    or DRIVE_FOLDER_NAME in .env). Useful when the user just wants to see
-    what's there without a specific name to search for.
-
-    Args:
-        limit: Max files to return (default 50, max 200).
-
-    Returns:
-        JSON string with the same shape as find_file_in_folder.
-    """
-    service, err = _get_drive_service()
-    if err:
-        return json.dumps(err)
-    target_id, folder_err = _resolve_dedicated_folder_id(service)
-    if folder_err:
-        return json.dumps({"isError": True, "message": folder_err})
-    if not target_id:
-        return json.dumps({
-            "isError": True,
-            "message": (
-                "No dedicated folder configured. Set DRIVE_FOLDER_ID or "
-                "DRIVE_FOLDER_NAME in .env so I know which folder to list."
-            ),
-        })
-    try:
-        results = (
-            service.files()
-            .list(
-                q=f"'{target_id}' in parents and trashed=false",
-                spaces="drive",
-                fields="files(id, name, mimeType, webViewLink, modifiedTime)",
-                pageSize=max(1, min(int(limit) if str(limit).isdigit() else 50, 200)),
-                orderBy="modifiedTime desc",
-            )
-            .execute()
-        )
-        files = results.get("files", [])
-        return json.dumps({
-            "count": len(files),
-            "folder_id": target_id,
-            "files": files,
-        })
     except HttpError as e:
         return json.dumps({"isError": True, "message": f"Drive API error: {e}"})
 
@@ -264,44 +249,65 @@ drive_agent = Agent(
     name="drive_agent",
     model="gemini-2.5-flash",
     description=(
-        "Finds files in the configured Google Drive folder and returns "
-        "shareable links. Use it whenever the user asks for a document, "
-        "spreadsheet, PDF, or any file that lives in their property "
-        "management Drive folder."
+        "Finds files in the user's shared Google Drive folders and returns "
+        "shareable links. Access is restricted to specific labeled folders "
+        "(e.g. 'emails', 'attachments') — the agent cannot see anything "
+        "else in the user's Drive."
     ),
     instruction="""
 You are the Google Drive sub-agent for a property management system.
 
-You have three tools:
+You have folder-scoped access: only specific folders that the user has
+EXPLICITLY shared with the service account are visible to you. The folders
+are referred to by short labels (e.g. "emails", "attachments").
 
-  find_file_in_folder(query, folder_id="", folder_name="", limit=10)
-    Search the dedicated Drive folder by file name (partial match).
-    Returns matching files including a webViewLink (the shareable URL).
+TOOLS
+
+  list_configured_folders()
+    Returns the labels and IDs of the folders you can see. Use this if the
+    user asks "what folders do you have?" or you're not sure which label
+    to search.
+
+  find_file_in_folder(query, folder_label="", limit=10)
+    Search by file name (partial match). Pass `folder_label` to restrict
+    to one folder (e.g. "emails") — strongly preferred when the user's
+    question implies a specific folder. Otherwise searches ALL folders.
+
+  list_folder(folder_label="", limit=50)
+    List the contents of a labeled folder, newest first. Use this when
+    the user doesn't have a specific filename ("what's in attachments?").
 
   get_file_link(file_id)
-    Return the webViewLink and metadata for a known file id.
-
-  list_dedicated_folder(limit=50)
-    List everything in the dedicated folder, newest first. Use this when
-    the user asks "what's in the folder" or has no specific filename.
+    Fetch metadata + webViewLink for a known file id.
 
 WORKFLOW
-- When the user asks for a file by name, call find_file_in_folder with the
-  most distinctive word(s) from their request as `query`. Drive searches
-  with substring/contains semantics.
-- If multiple matches come back, present a short list (name + modified
-  time + link) and let the user disambiguate. If only one match, return
-  it immediately with its webViewLink.
-- Always include the webViewLink in your reply — that IS the shareable link.
+
+- The user has TWO labeled folders configured by default:
+    * "emails"      — structured JSON files (one per email thread)
+    * "attachments" — files extracted from emails (PDFs, images, etc.)
+  Always pick the right `folder_label` based on the request:
+    "find the lease attachment"    → folder_label="attachments"
+    "find email thread about X"    → folder_label="emails"
+    "show me the boiler invoice"   → folder_label="attachments"
+    "what files are there?"        → list_folder() (all folders)
+
+- For each match, present:
+    📄 <name>            (modified <modifiedTime>)
+       <webViewLink>
+
+  Don't summarise file contents — you only have metadata.
+
 - If a tool returns {"needsAuth": true, "message": "..."}, STOP and reply
-  with the exact text from "message" so the user can sign in.
+  with the exact message from the tool so the user can resolve setup
+  (e.g. drop the service-account.json file into place).
 
-RESPONSE FORMAT
-For each file returned, format as:
-  📄 <name>         (last modified <modifiedTime>)
-     <webViewLink>
-
-Don't summarise file contents — you don't have them. Just return the link.
+- If the user asks for something that clearly isn't in any configured
+  folder, say so — don't pretend a result exists.
 """,
-    tools=[find_file_in_folder, get_file_link, list_dedicated_folder],
+    tools=[
+        list_configured_folders,
+        find_file_in_folder,
+        list_folder,
+        get_file_link,
+    ],
 )

@@ -13,6 +13,7 @@ email_agent/.env
 property_management_agent/credentials.json
 property_management_agent/credentials-web.json
 property_management_agent/token.json
+property_management_agent/service-account.json
 property_management_agent/.env
 
 # ==========================================
