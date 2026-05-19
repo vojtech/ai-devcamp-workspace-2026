@@ -207,7 +207,7 @@ with st.sidebar:
 
 # ── Summary header ──────────────────────────────────────────────────────────────
 def summary_metrics():
-    cols = st.columns(7)
+    cols = st.columns(8)
     counts = {
         "Employees":        len(load_table("employees", cb)),
         "Managers":         len(load_table("property_managers", cb)),
@@ -216,6 +216,7 @@ def summary_metrics():
         "Meetings":         len(load_table("meetings", cb)),
         "Classifications":  len(load_table("email_classifications", cb)),
         "Archive (RAG)":    len(load_table("email_archive", cb)),
+        "Attachments":      len(load_table("attachment_extractions", cb)),
     }
     for col, (label, n) in zip(cols, counts.items()):
         col.metric(label, n)
@@ -225,8 +226,9 @@ summary_metrics()
 st.divider()
 
 # ── Tabs ────────────────────────────────────────────────────────────────────────
-tab_search, tab_class, tab_emp, tab_mgr, tab_con, tab_task, tab_meet = st.tabs([
+tab_search, tab_attach, tab_class, tab_emp, tab_mgr, tab_con, tab_task, tab_meet = st.tabs([
     "🔎 Email archive search",
+    "📎 Attachments",
     "📨 Email classifications",
     "👥 Employees",
     "🧑‍💼 Property managers",
@@ -393,6 +395,206 @@ with tab_search:
                 if sel_tid:
                     full_row = fetch_archive_row(sel_tid, cb)
                     render_thread_detail(full_row or {}, key_prefix="browse_")
+
+
+# ── Attachments (extracted content + user corrections) ────────────────────────
+with tab_attach:
+    st.subheader("Attachments — extracted content + manual corrections")
+    st.caption(
+        "Browse files extracted via Gemini multimodal. Click a row to view "
+        "the full text and **correct anything the model got wrong**. "
+        "Corrections are preserved across re-extracts."
+    )
+
+    # Action row: extract everything in attachments
+    a1, a2, a3 = st.columns([1, 1, 3])
+    with a1:
+        if st.button("⬇ Extract all", help="Extract every file in the 'attachments' folder. Skips unchanged."):
+            with st.spinner("Extracting attachments… (one Gemini call per file)"):
+                try:
+                    from property_management_agent.drive_agent.agent import (
+                        extract_and_save_all_attachments,
+                    )
+                    rep = json.loads(extract_and_save_all_attachments())
+                    st.success(
+                        f"Done — extracted={rep.get('extracted', 0)}, "
+                        f"skipped={rep.get('skipped_unchanged', 0)}, "
+                        f"errors={rep.get('errors', 0)}"
+                    )
+                    st.cache_data.clear()
+                    st.session_state.cache_buster += 1
+                except Exception as e:
+                    st.error(f"Bulk extract failed: {type(e).__name__}: {e}")
+    with a2:
+        if st.button("🔁 Force re-extract all", help="Re-extract even files unchanged in Drive (uses Gemini quota)."):
+            with st.spinner("Force-re-extracting attachments…"):
+                try:
+                    from property_management_agent.drive_agent.agent import (
+                        extract_and_save_all_attachments,
+                    )
+                    rep = json.loads(extract_and_save_all_attachments(force=True))
+                    st.success(
+                        f"Done — extracted={rep.get('extracted', 0)}, "
+                        f"errors={rep.get('errors', 0)} (corrections preserved)"
+                    )
+                    st.cache_data.clear()
+                    st.session_state.cache_buster += 1
+                except Exception as e:
+                    st.error(f"Bulk re-extract failed: {type(e).__name__}: {e}")
+
+    attach_df = load_table("attachment_extractions", cb)
+    if attach_df.empty:
+        st.info(
+            "No attachments extracted yet. Click **⬇ Extract all** above, or "
+            "ask the agent: *\"extract and save all attachments\"*."
+        )
+    else:
+        # Filter chips
+        c1, c2, c3 = st.columns(3)
+        mime_filter = c1.text_input(
+            "MIME contains",
+            placeholder="pdf, image/, json …",
+            key="attach_mime_filter",
+        )
+        has_corr = c2.selectbox(
+            "Correction status",
+            options=["All", "Only corrected", "Only uncorrected"],
+            key="attach_corr_filter",
+        )
+        rows_limit = c3.number_input("Max rows", 1, 500, 100, key="attach_limit")
+
+        df = attach_df.copy()
+        if mime_filter.strip():
+            df = df[df["mime_type"].astype(str).str.contains(
+                mime_filter.strip(), case=False, na=False
+            )]
+        if has_corr == "Only corrected":
+            df = df[df["corrected_content"].astype(str).str.strip() != ""]
+        elif has_corr == "Only uncorrected":
+            df = df[(df["corrected_content"].isna()) | (df["corrected_content"].astype(str).str.strip() == "")]
+        df = df.head(int(rows_limit))
+
+        # Render-ready columns
+        df["corrected"] = df["corrected_content"].astype(str).str.strip().ne("").map(
+            {True: "✏️", False: ""}
+        )
+        df["preview"] = (
+            df["corrected_content"].fillna(df["extracted_content"]).astype(str)
+              .str.replace("\n", " ", regex=False).str.slice(0, 200)
+        )
+
+        st.caption(f"**{len(df)}** attachment(s) shown. Click a row to view / edit.")
+        list_cols = [c for c in (
+            "file_name", "mime_type", "content_type", "corrected",
+            "size_bytes", "extracted_at", "corrected_at", "preview",
+            "web_view_link", "drive_file_id",
+        ) if c in df.columns]
+        evt = st.dataframe(
+            df[list_cols].reset_index(drop=True),
+            use_container_width=True,
+            hide_index=True,
+            on_select="rerun",
+            selection_mode="single-row",
+            key="attach_browse_table",
+            column_config={
+                "web_view_link": st.column_config.LinkColumn("Open", display_text="🔗"),
+                "preview": st.column_config.TextColumn("preview", width="large"),
+                "file_name": st.column_config.TextColumn("file_name", width="medium"),
+            },
+        )
+
+        sel = evt.selection.rows if evt and getattr(evt, "selection", None) else []
+        if sel:
+            sel_id = df.reset_index(drop=True).iloc[sel[0]]["drive_file_id"]
+            # Pull the full row (incl. extracted_content + corrected_content)
+            full_row = attach_df[attach_df["drive_file_id"] == sel_id]
+            if not full_row.empty:
+                row = full_row.iloc[0].to_dict()
+                with st.container(border=True):
+                    head_a, head_b = st.columns([4, 1])
+                    with head_a:
+                        st.markdown(f"### {row.get('file_name') or '(no name)'}")
+                        meta = []
+                        if row.get("mime_type"):    meta.append(f"**Type:** {row['mime_type']}")
+                        if row.get("content_type"): meta.append(f"**Path:** {row['content_type']}")
+                        if row.get("size_bytes"):   meta.append(f"**Size:** {row['size_bytes']:,} B")
+                        if row.get("extracted_at"): meta.append(f"**Extracted:** {row['extracted_at']}")
+                        if row.get("corrected_at"): meta.append(f"**Corrected:** {row['corrected_at']}")
+                        if meta:
+                            st.caption(" · ".join(meta))
+                    with head_b:
+                        if row.get("web_view_link"):
+                            st.link_button("🔗 Open in Drive", row["web_view_link"])
+
+                    extracted = row.get("extracted_content") or ""
+                    corrected = row.get("corrected_content") or ""
+                    has_correction = bool(corrected.strip())
+
+                    if has_correction:
+                        st.success("✏️ This attachment has a user correction stored.")
+
+                    # Two side-by-side panes: model output (RO) | your correction (editable)
+                    col_orig, col_edit = st.columns(2)
+                    with col_orig:
+                        st.markdown("**📄 Model extraction (read-only)**")
+                        st.text_area(
+                            "Extracted",
+                            value=extracted,
+                            height=400,
+                            disabled=True,
+                            label_visibility="collapsed",
+                            key=f"attach_extracted_{sel_id}",
+                        )
+                    with col_edit:
+                        st.markdown("**✏️ Your correction**")
+                        edit_default = corrected if has_correction else extracted
+                        new_text = st.text_area(
+                            "Correction",
+                            value=edit_default,
+                            height=400,
+                            label_visibility="collapsed",
+                            key=f"attach_correction_{sel_id}",
+                            help=(
+                                "Edit anything the model got wrong. "
+                                "Saved text overrides the model output everywhere."
+                            ),
+                        )
+
+                    btn_a, btn_b, btn_c = st.columns([1, 1, 3])
+                    with btn_a:
+                        if st.button("💾 Save correction", key=f"save_corr_{sel_id}", type="primary"):
+                            try:
+                                from property_management_agent.database_agent.db import (
+                                    correct_attachment_extraction,
+                                )
+                                res = json.loads(correct_attachment_extraction(sel_id, new_text))
+                                if res.get("isError"):
+                                    st.error(res.get("message", "Save failed."))
+                                else:
+                                    st.success(f"Correction saved ({res.get('status')}).")
+                                    st.cache_data.clear()
+                                    st.session_state.cache_buster += 1
+                                    st.rerun()
+                            except Exception as e:
+                                st.error(f"Save failed: {type(e).__name__}: {e}")
+                    with btn_b:
+                        if st.button("↩ Revert to model", key=f"revert_corr_{sel_id}",
+                                       disabled=not has_correction,
+                                       help="Clears your correction and uses the model's extraction."):
+                            try:
+                                from property_management_agent.database_agent.db import (
+                                    correct_attachment_extraction,
+                                )
+                                res = json.loads(correct_attachment_extraction(sel_id, ""))
+                                if res.get("isError"):
+                                    st.error(res.get("message", "Revert failed."))
+                                else:
+                                    st.success("Correction cleared.")
+                                    st.cache_data.clear()
+                                    st.session_state.cache_buster += 1
+                                    st.rerun()
+                            except Exception as e:
+                                st.error(f"Revert failed: {type(e).__name__}: {e}")
 
 
 # ── Email Classifications ──────────────────────────────────────────────────────

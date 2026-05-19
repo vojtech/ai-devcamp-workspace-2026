@@ -24,6 +24,11 @@ from .db import (
     search_email_archive,
     count_email_archive,
     list_ingested_threads,
+    save_attachment_extraction,
+    correct_attachment_extraction,
+    get_attachment_extraction,
+    list_attachment_extractions,
+    count_attachment_extractions,
     get_db_summary,
 )
 
@@ -84,6 +89,29 @@ EMAIL CLASSIFICATIONS  (produced by the classifier_agent):
   get_email_classification(thread_id, message_id)
   classification_counts()
 
+ATTACHMENT EXTRACTIONS (PDFs / images / docs read by drive_agent.read_drive_file):
+  save_attachment_extraction(
+      drive_file_id, file_name, mime_type, web_view_link,
+      content_type, extracted_content, size_bytes, drive_modified_time
+  )
+    → Upsert. Preserves any existing corrected_content — never blows
+      away user edits when extraction is re-run.
+
+  correct_attachment_extraction(drive_file_id, corrected_content)
+    → Apply a user correction. Empty corrected_content clears the
+      correction (reverts to using the model's output).
+
+  get_attachment_extraction(drive_file_id)
+    → Full row + an `effective_content` field
+      (= corrected_content if set, else extracted_content).
+
+  list_attachment_extractions(has_correction, mime_type, limit)
+    → Browse list with previews (no full bodies). has_correction:
+      "true" / "false" / "" (no filter).
+
+  count_attachment_extractions()
+    → {total, corrected, uncorrected, by_mime_type}.
+
 SUMMARY:
   get_db_summary()
 
@@ -113,6 +141,11 @@ Rules:
         search_email_archive,
         count_email_archive,
         list_ingested_threads,
+        save_attachment_extraction,
+        correct_attachment_extraction,
+        get_attachment_extraction,
+        list_attachment_extractions,
+        count_attachment_extractions,
         get_db_summary,
     ],
 )

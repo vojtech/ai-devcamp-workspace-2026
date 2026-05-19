@@ -162,6 +162,29 @@ def init_db() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_archive_thread ON email_archive(thread_id);
             CREATE INDEX IF NOT EXISTS idx_archive_drive_file ON email_archive(drive_file_id);
+
+            -- Extracted content of attachments (PDFs, images, docs) read from
+            -- the Drive 'attachments' folder via read_drive_file. The user can
+            -- correct what the model got wrong; corrected_content takes
+            -- precedence over extracted_content for downstream consumers.
+            CREATE TABLE IF NOT EXISTS attachment_extractions (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                drive_file_id       TEXT UNIQUE NOT NULL,
+                file_name           TEXT,
+                mime_type           TEXT,
+                web_view_link       TEXT,
+                content_type        TEXT,
+                extracted_content   TEXT,
+                corrected_content   TEXT,
+                size_bytes          INTEGER DEFAULT 0,
+                drive_modified_time TEXT DEFAULT '',
+                extracted_at        DATETIME DEFAULT CURRENT_TIMESTAMP,
+                corrected_at        DATETIME
+            );
+            CREATE INDEX IF NOT EXISTS idx_attach_mime
+                ON attachment_extractions(mime_type);
+            CREATE INDEX IF NOT EXISTS idx_attach_corrected
+                ON attachment_extractions(corrected_at);
         """)
         # Idempotent migrations on email_archive — silently no-op if the
         # column already exists. Used so DBs created before incremental sync
@@ -865,3 +888,191 @@ def list_ingested_threads(limit: int = 50) -> str:
             FROM email_archive ORDER BY ingested_at DESC LIMIT ?
         """, (n,)).fetchall()
     return json.dumps([dict(r) for r in rows], default=str)
+
+
+# ── Attachment extractions (PDFs, images, docs via read_drive_file) ───────────
+# Stores both the model-extracted text AND any user correction. The downstream
+# "effective" content is COALESCE(corrected_content, extracted_content) so
+# corrections override the model wherever the content is consumed.
+
+def save_attachment_extraction(
+    drive_file_id: str,
+    file_name: str = "",
+    mime_type: str = "",
+    web_view_link: str = "",
+    content_type: str = "",
+    extracted_content: str = "",
+    size_bytes: int = 0,
+    drive_modified_time: str = "",
+) -> str:
+    """Insert (or update) the extracted content for a Drive attachment.
+
+    Idempotent on drive_file_id. CRITICAL: on update we replace
+    extracted_content but PRESERVE corrected_content / corrected_at, so
+    re-running extraction never silently throws away the user's edits.
+    """
+    if not drive_file_id:
+        return json.dumps({"isError": True, "message": "drive_file_id is required"})
+
+    with get_conn() as conn:
+        existing = conn.execute(
+            "SELECT id FROM attachment_extractions WHERE drive_file_id=?",
+            (drive_file_id,),
+        ).fetchone()
+        if existing:
+            conn.execute("""
+                UPDATE attachment_extractions
+                SET file_name=COALESCE(NULLIF(?,  ''), file_name),
+                    mime_type=COALESCE(NULLIF(?,  ''), mime_type),
+                    web_view_link=COALESCE(NULLIF(?,  ''), web_view_link),
+                    content_type=COALESCE(NULLIF(?,  ''), content_type),
+                    extracted_content=?,
+                    size_bytes=?,
+                    drive_modified_time=?,
+                    extracted_at=CURRENT_TIMESTAMP
+                WHERE id=?
+            """, (
+                file_name, mime_type, web_view_link, content_type,
+                extracted_content, size_bytes, drive_modified_time,
+                existing["id"],
+            ))
+            return json.dumps({"status": "updated", "id": existing["id"],
+                                "drive_file_id": drive_file_id})
+
+        cur = conn.execute("""
+            INSERT INTO attachment_extractions
+                (drive_file_id, file_name, mime_type, web_view_link,
+                 content_type, extracted_content, size_bytes, drive_modified_time)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            drive_file_id, file_name, mime_type, web_view_link,
+            content_type, extracted_content, size_bytes, drive_modified_time,
+        ))
+    return json.dumps({"status": "inserted", "id": cur.lastrowid,
+                        "drive_file_id": drive_file_id})
+
+
+def correct_attachment_extraction(
+    drive_file_id: str,
+    corrected_content: str,
+) -> str:
+    """Apply a user correction to an attachment's extracted content.
+
+    Pass an empty corrected_content to CLEAR an existing correction
+    (reverts the row to using the model's extracted_content).
+    """
+    if not drive_file_id:
+        return json.dumps({"isError": True, "message": "drive_file_id is required"})
+
+    with get_conn() as conn:
+        existing = conn.execute(
+            "SELECT id FROM attachment_extractions WHERE drive_file_id=?",
+            (drive_file_id,),
+        ).fetchone()
+        if not existing:
+            return json.dumps({
+                "isError": True,
+                "message": f"No extraction stored for drive_file_id '{drive_file_id}'. "
+                            "Run extract_and_save_drive_file first.",
+            })
+        if corrected_content == "":
+            # Empty string = clear correction
+            conn.execute("""
+                UPDATE attachment_extractions
+                SET corrected_content=NULL, corrected_at=NULL
+                WHERE id=?
+            """, (existing["id"],))
+            return json.dumps({"status": "cleared", "drive_file_id": drive_file_id})
+        conn.execute("""
+            UPDATE attachment_extractions
+            SET corrected_content=?, corrected_at=CURRENT_TIMESTAMP
+            WHERE id=?
+        """, (corrected_content, existing["id"]))
+    return json.dumps({"status": "corrected", "drive_file_id": drive_file_id})
+
+
+def get_attachment_extraction(drive_file_id: str) -> str:
+    """Return the full attachment row (incl. both extracted and corrected
+    content) plus an `effective_content` field that is the corrected version
+    if present, else the extracted version."""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM attachment_extractions WHERE drive_file_id=?",
+            (drive_file_id,),
+        ).fetchone()
+    if not row:
+        return json.dumps({})
+    d = dict(row)
+    d["effective_content"] = d.get("corrected_content") or d.get("extracted_content") or ""
+    d["has_correction"] = bool(d.get("corrected_content"))
+    return json.dumps(d, default=str)
+
+
+def list_attachment_extractions(
+    has_correction: str = "",
+    mime_type: str = "",
+    limit: int = 50,
+) -> str:
+    """Browse stored attachment extractions.
+
+    Args:
+        has_correction: "true" → only rows the user has corrected;
+                        "false" → only rows still on the model's output;
+                        ""      → no filter.
+        mime_type:      substring match on mime_type (e.g. "pdf", "image/").
+        limit:          max rows (default 50, max 500).
+
+    Returns a compact list (no full content bodies) suitable for browse UIs.
+    """
+    where: list[str] = []
+    params: list[Any] = []
+    flag = has_correction.lower().strip()
+    if flag == "true":
+        where.append("corrected_content IS NOT NULL AND corrected_content != ''")
+    elif flag == "false":
+        where.append("(corrected_content IS NULL OR corrected_content = '')")
+    if mime_type:
+        where.append("mime_type LIKE ?")
+        params.append(f"%{mime_type}%")
+
+    sql = (
+        "SELECT id, drive_file_id, file_name, mime_type, content_type, "
+        "size_bytes, web_view_link, drive_modified_time, extracted_at, "
+        "corrected_at, "
+        "CASE WHEN corrected_content IS NOT NULL AND corrected_content != '' "
+        "     THEN 1 ELSE 0 END AS has_correction, "
+        "substr(COALESCE(corrected_content, extracted_content), 1, 200) AS preview "
+        "FROM attachment_extractions"
+    )
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY COALESCE(corrected_at, extracted_at) DESC LIMIT ?"
+    n = max(1, min(int(limit) if str(limit).isdigit() else 50, 500))
+    params.append(n)
+
+    with get_conn() as conn:
+        rows = conn.execute(sql, params).fetchall()
+    return json.dumps([dict(r) for r in rows], default=str)
+
+
+def count_attachment_extractions() -> str:
+    """Summary counts for the attachments dashboard."""
+    with get_conn() as conn:
+        total = conn.execute("SELECT COUNT(*) FROM attachment_extractions").fetchone()[0]
+        corrected = conn.execute(
+            "SELECT COUNT(*) FROM attachment_extractions "
+            "WHERE corrected_content IS NOT NULL AND corrected_content != ''"
+        ).fetchone()[0]
+        by_mime = {
+            r["mime_type"] or "unknown": r["c"]
+            for r in conn.execute(
+                "SELECT mime_type, COUNT(*) AS c FROM attachment_extractions "
+                "GROUP BY mime_type"
+            ).fetchall()
+        }
+    return json.dumps({
+        "total": total,
+        "corrected": corrected,
+        "uncorrected": total - corrected,
+        "by_mime_type": by_mime,
+    })

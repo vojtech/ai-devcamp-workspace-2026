@@ -551,6 +551,165 @@ def _export_google_native(service, base: dict, export_mime: str, content_type: s
         return json.dumps({**base, "isError": True, "message": f"Drive export failed: {e}"})
 
 
+# ── Extract-and-save (persist read_drive_file output to the DB) ───────────────
+# These tools call read_drive_file and then persist the result via
+# database_agent.db.save_attachment_extraction. The DB layer is idempotent
+# on drive_file_id AND preserves any user corrections, so re-running these
+# tools is always safe.
+
+def extract_and_save_drive_file(file_id: str, force: bool = False) -> str:
+    """
+    Read a single Drive file via read_drive_file and persist the extracted
+    content to the local attachment_extractions table.
+
+    Args:
+        file_id: Drive file id.
+        force:   If True, re-extract even when the stored record's
+                 drive_modified_time matches the file's current modifiedTime
+                 (i.e. the file hasn't changed). Defaults to False so
+                 re-running is a cheap no-op for unchanged files.
+
+    Returns:
+        JSON: {drive_file_id, name, mime_type, content_type, size_bytes,
+               status: "extracted" | "skipped_unchanged" | "isError",
+               preview: "<first 200 chars of extracted content>",
+               had_correction: <bool — whether a previous user correction
+                                exists; the correction is PRESERVED>}.
+    """
+    from ..database_agent.db import (
+        save_attachment_extraction as _db_save,
+        get_attachment_extraction as _db_get,
+    )
+
+    # Look up Drive metadata once to decide whether to skip
+    service, err = _drive_service()
+    if err:
+        return json.dumps(err)
+    try:
+        meta = (
+            service.files()
+            .get(
+                fileId=file_id,
+                fields="id, name, mimeType, modifiedTime, webViewLink",
+                supportsAllDrives=True,
+            )
+            .execute()
+        )
+    except HttpError as e:
+        return json.dumps({"isError": True, "message": f"Drive API error: {e}"})
+    drive_mtime = meta.get("modifiedTime", "") or ""
+
+    stored_raw = _db_get(file_id)
+    stored = json.loads(stored_raw) if stored_raw else {}
+    had_correction = bool(stored.get("corrected_content"))
+
+    if (not force
+            and stored
+            and stored.get("drive_modified_time")
+            and stored["drive_modified_time"] >= drive_mtime):
+        return json.dumps({
+            "drive_file_id": file_id,
+            "name": meta.get("name", ""),
+            "mime_type": meta.get("mimeType", ""),
+            "content_type": stored.get("content_type", ""),
+            "size_bytes": stored.get("size_bytes", 0),
+            "status": "skipped_unchanged",
+            "preview": (stored.get("corrected_content") or stored.get("extracted_content") or "")[:200],
+            "had_correction": had_correction,
+        })
+
+    # Run the read
+    read_raw = read_drive_file(file_id)
+    read = json.loads(read_raw)
+    if read.get("isError"):
+        return json.dumps({**read, "status": "isError",
+                            "had_correction": had_correction})
+
+    save_raw = _db_save(
+        drive_file_id=read["file_id"],
+        file_name=read.get("name", ""),
+        mime_type=read.get("mime_type", ""),
+        web_view_link=read.get("web_view_link", ""),
+        content_type=read.get("content_type", ""),
+        extracted_content=read.get("content", ""),
+        size_bytes=read.get("size_bytes", 0),
+        drive_modified_time=drive_mtime,
+    )
+    save = json.loads(save_raw)
+    if save.get("isError"):
+        return json.dumps({**save, "status": "isError",
+                            "had_correction": had_correction})
+
+    return json.dumps({
+        "drive_file_id": read["file_id"],
+        "name": read.get("name", ""),
+        "mime_type": read.get("mime_type", ""),
+        "content_type": read.get("content_type", ""),
+        "size_bytes": read.get("size_bytes", 0),
+        "status": "extracted",
+        "preview": (read.get("content") or "")[:200],
+        "had_correction": had_correction,
+    })
+
+
+def extract_and_save_all_attachments(
+    folder_label: str = "attachments",
+    limit: int = 0,
+    force: bool = False,
+) -> str:
+    """
+    Bulk-extract every supported file in a labeled Drive folder and save
+    the extracted content. Files unchanged since the last extraction are
+    skipped (unless force=True). Existing user corrections are preserved.
+
+    Args:
+        folder_label: Which configured Drive folder to scan. Default
+                      "attachments". Use list_configured_folders() if unsure.
+        limit:        Max files to process this run (0 = no limit).
+        force:        Re-extract every file regardless of modifiedTime.
+
+    Returns:
+        JSON: {folder_label, files_seen, extracted, skipped_unchanged,
+               errors, errors_detail, by_content_type}.
+    """
+    listing_raw = list_folder(folder_label, limit=500)
+    listing = json.loads(listing_raw)
+    if listing.get("isError"):
+        return json.dumps(listing)
+
+    files = listing.get("files", []) or []
+    if limit and limit > 0:
+        files = files[:limit]
+
+    extracted = 0
+    skipped_unchanged = 0
+    errors: list[dict] = []
+    by_ct: dict[str, int] = {}
+
+    for f in files:
+        r_raw = extract_and_save_drive_file(f["id"], force=force)
+        r = json.loads(r_raw)
+        status = r.get("status")
+        if status == "extracted":
+            extracted += 1
+            ct = r.get("content_type", "")
+            by_ct[ct] = by_ct.get(ct, 0) + 1
+        elif status == "skipped_unchanged":
+            skipped_unchanged += 1
+        else:
+            errors.append({"file": f.get("name", ""), "error": r.get("message", str(r))})
+
+    return json.dumps({
+        "folder_label": folder_label,
+        "files_seen": len(files),
+        "extracted": extracted,
+        "skipped_unchanged": skipped_unchanged,
+        "errors": len(errors),
+        "errors_detail": errors[:10],
+        "by_content_type": by_ct,
+    })
+
+
 # ── Agent definition ───────────────────────────────────────────────────────────
 
 drive_agent = Agent(
@@ -605,7 +764,20 @@ TOOLS
       - Google Sheet        → exported to CSV
     Use this whenever the user asks "what does this file say", "summarise
     this PDF", "what does the photo show", "extract the invoice details",
-    "transcribe the meter reading", etc.
+    "transcribe the meter reading", etc. **Stateless — does NOT persist.**
+
+  extract_and_save_drive_file(file_id, force=False)
+    Same as read_drive_file BUT also persists the extracted content to the
+    local attachment_extractions table so the user can review / correct it
+    later via the UI. Idempotent on drive_file_id and modifiedTime — skips
+    files that haven't changed since the last extraction. **Existing user
+    corrections are PRESERVED** when re-extracting. Use this when the user
+    wants the result remembered (e.g. "extract and save the invoice",
+    "remember what this letter says").
+
+  extract_and_save_all_attachments(folder_label="attachments", limit=0, force=False)
+    Bulk version: extract every file in a labeled folder and save them.
+    Reports {extracted, skipped_unchanged, errors, by_content_type}.
 
 WORKFLOW
 
@@ -638,5 +810,7 @@ WORKFLOW
         get_file_link,
         download_drive_file_content,
         read_drive_file,
+        extract_and_save_drive_file,
+        extract_and_save_all_attachments,
     ],
 )
