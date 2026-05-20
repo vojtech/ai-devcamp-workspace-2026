@@ -272,6 +272,17 @@ with tab_search:
         action = c3.selectbox("Requires action", options=["All", "Yes", "No"], key="srch_act")
         limit = c4.number_input("Max results", min_value=1, max_value=50, value=10, key="srch_lim")
 
+        compare_vertex = st.checkbox(
+            "🆚 Also run Vertex AI Search (side-by-side comparison)",
+            value=False,
+            key="srch_compare_vertex",
+            help=(
+                "Runs the same query through Google's managed Vertex AI Search "
+                "data store. Needs one-time GCP setup — instructions appear "
+                "below if not configured yet."
+            ),
+        )
+
         if q.strip():
             try:
                 from property_management_agent._embeddings import embed_for_query
@@ -355,6 +366,82 @@ with tab_search:
                         if sel_tid:
                             full_row = fetch_archive_row(sel_tid, cb)
                             render_thread_detail(full_row or {}, key_prefix="srch_")
+
+            # ── Vertex AI Search side-by-side ──────────────────────────
+            if compare_vertex:
+                st.divider()
+                st.markdown("### 🆚 Vertex AI Search results")
+                st.caption(
+                    "Same query, Google's managed RAG (chunked + reranked). "
+                    "Useful for accuracy comparisons. Indexing is async — "
+                    "freshly-pushed docs take 5–30 min to appear."
+                )
+                try:
+                    from property_management_agent import _vertex_search as _vx
+                except Exception as e:
+                    st.error(f"Could not load Vertex backend: {e}")
+                    _vx = None
+
+                if _vx is not None:
+                    with st.spinner("Querying Vertex AI Search…"):
+                        v_result = _vx.search(q, limit=int(limit))
+                    if v_result.get("needsSetup"):
+                        st.warning("Vertex AI Search is not configured yet.")
+                        with st.expander("📘 One-time setup steps", expanded=True):
+                            st.code(v_result.get("message", ""), language="text")
+                            st.markdown(
+                                "After running both commands, click "
+                                "**Index now** below to push your data."
+                            )
+                    elif v_result.get("isError"):
+                        st.error(v_result.get("message", "Vertex query failed."))
+                    else:
+                        v_hits = v_result.get("results", [])
+                        st.caption(f"**{len(v_hits)}** Vertex match(es).")
+                        if v_hits:
+                            v_df = pd.DataFrame(v_hits)
+                            v_show = [c for c in (
+                                "title", "snippet", "source", "web_view_link", "doc_id",
+                            ) if c in v_df.columns]
+                            st.dataframe(
+                                v_df[v_show],
+                                use_container_width=True,
+                                hide_index=True,
+                                column_config={
+                                    "web_view_link": st.column_config.LinkColumn(
+                                        "Open", display_text="🔗"
+                                    ),
+                                    "snippet": st.column_config.TextColumn("snippet", width="large"),
+                                    "title":   st.column_config.TextColumn("title", width="medium"),
+                                },
+                            )
+                        # Status + index button at the bottom of the Vertex block
+                        with st.expander("⚙️ Vertex index status / push data", expanded=False):
+                            status = _vx.get_status()
+                            if status.get("available"):
+                                st.success(
+                                    f"Connected — project={status.get('project_id')}, "
+                                    f"location={status.get('location')}, "
+                                    f"data_store={status.get('data_store')}"
+                                )
+                            else:
+                                st.warning(status.get("reason", "Not available."))
+                            if st.button("⬆ Index now (push email_archive + attachments)",
+                                            key="vx_index_now"):
+                                with st.spinner("Pushing documents… (each takes a moment)"):
+                                    rep = _vx.index_everything()
+                                if rep.get("needsSetup"):
+                                    st.error(rep.get("message", "Setup required."))
+                                else:
+                                    ea = rep.get("email_archive", {})
+                                    at = rep.get("attachment_extractions", {})
+                                    st.success(
+                                        f"Pushed: emails={ea.get('indexed', 0)} "
+                                        f"(errors={ea.get('errors', 0)}), "
+                                        f"attachments={at.get('indexed', 0)} "
+                                        f"(errors={at.get('errors', 0)})"
+                                    )
+                                    st.info(rep.get("note", ""))
         else:
             st.caption(
                 f"Type a query above. Currently **{len(archive_df)}** "

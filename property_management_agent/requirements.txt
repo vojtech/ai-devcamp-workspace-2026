@@ -6,6 +6,9 @@ httpx>=0.27.0
 mcp>=1.0.0
 # Vector search over the email archive (sqlite-vec + Gemini embeddings)
 sqlite-vec>=0.1.6
+# Optional: Vertex AI Search backend (Agent Builder) — used by the side-by-side
+# accuracy comparison in the UI. Falls back gracefully if not installed.
+google-cloud-discoveryengine>=0.11.0
 # UI (optional — install only if you want to run the Streamlit data browser)
 streamlit>=1.30.0
 pandas>=2.0.0
