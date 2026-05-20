@@ -613,6 +613,35 @@ def search_email_archive(
     )
 
 
+def search_archive_vertex(query: str, limit: int = 10) -> str:
+    """
+    Alternative archive search backed by Vertex AI Search (managed RAG).
+    Same shape of result as search_email_archive but the chunking, embedding,
+    and reranking are all done by Google. Used for accuracy comparisons.
+
+    Requires the one-time GCP setup (Discovery Engine API + IAM role) — if
+    that's not done, this tool returns a clear "needsSetup" message with the
+    exact commands to run.
+    """
+    from . import _vertex_search as _v
+    return json.dumps(_v.search(query, limit=limit))
+
+
+def vertex_index_status() -> str:
+    """Probe Vertex AI Search: is it set up, reachable, and pointing at the
+    right project? Returns availability + setup instructions on failure."""
+    from . import _vertex_search as _v
+    return json.dumps(_v.get_status())
+
+
+def vertex_index_all(limit: int = 0) -> str:
+    """Push every email_archive thread and every attachment_extractions row
+    into the Vertex AI Search data store. Idempotent. Newly-pushed docs
+    take 5–30 min to become searchable (Google's async indexing)."""
+    from . import _vertex_search as _v
+    return json.dumps(_v.index_everything(limit=limit))
+
+
 # ── Optional: run a sync on `adk web` startup ─────────────────────────────────
 # Controlled by AUTO_SYNC_ARCHIVE_ON_STARTUP. Disabled by default — set it to
 # "true" / "1" / "yes" in .env to enable. The sync runs in a daemon thread so
@@ -879,6 +908,9 @@ AUTHENTICATION HANDLING
         extract_meetings_from_text,
         ingest_email_archive_from_drive,
         search_email_archive,
+        search_archive_vertex,
+        vertex_index_status,
+        vertex_index_all,
         classifier_tool,
         drive_tool,
         db_tool,
