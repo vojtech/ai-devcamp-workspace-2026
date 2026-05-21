@@ -642,6 +642,29 @@ def vertex_index_all(limit: int = 0) -> str:
     return json.dumps(_v.index_everything(limit=limit))
 
 
+def search_archive_gemini(query: str, limit: int = 10) -> str:
+    """Alternative archive search backed by Gemini File Search — a managed RAG
+    built directly into the google-genai SDK. Uses the same GOOGLE_API_KEY as
+    the rest of the agent (no extra GCP API enable / IAM role). Returns the
+    top retrieved chunks and a grounded answer."""
+    from . import _gemini_file_search as _g
+    return json.dumps(_g.search(query, limit=limit))
+
+
+def gemini_index_status() -> str:
+    """Probe Gemini File Search: reachable? store exists? doc counts?"""
+    from . import _gemini_file_search as _g
+    return json.dumps(_g.get_status())
+
+
+def gemini_index_all(limit: int = 0) -> str:
+    """Push every email_archive thread and every attachment_extractions row
+    into the Gemini File Search store. Idempotent on source_id (existing docs
+    are deleted and re-uploaded so corrections take effect)."""
+    from . import _gemini_file_search as _g
+    return json.dumps(_g.index_everything(limit=limit))
+
+
 # ── Optional: run a sync on `adk web` startup ─────────────────────────────────
 # Controlled by AUTO_SYNC_ARCHIVE_ON_STARTUP. Disabled by default — set it to
 # "true" / "1" / "yes" in .env to enable. The sync runs in a daemon thread so
@@ -911,6 +934,9 @@ AUTHENTICATION HANDLING
         search_archive_vertex,
         vertex_index_status,
         vertex_index_all,
+        search_archive_gemini,
+        gemini_index_status,
+        gemini_index_all,
         classifier_tool,
         drive_tool,
         db_tool,
