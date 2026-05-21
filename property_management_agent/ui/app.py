@@ -272,16 +272,28 @@ with tab_search:
         action = c3.selectbox("Requires action", options=["All", "Yes", "No"], key="srch_act")
         limit = c4.number_input("Max results", min_value=1, max_value=50, value=10, key="srch_lim")
 
-        compare_vertex = st.checkbox(
-            "🆚 Also run Vertex AI Search (side-by-side comparison)",
-            value=False,
-            key="srch_compare_vertex",
-            help=(
-                "Runs the same query through Google's managed Vertex AI Search "
-                "data store. Needs one-time GCP setup — instructions appear "
-                "below if not configured yet."
-            ),
-        )
+        cmp_a, cmp_b = st.columns(2)
+        with cmp_a:
+            compare_vertex = st.checkbox(
+                "🆚 Vertex AI Search",
+                value=False,
+                key="srch_compare_vertex",
+                help=(
+                    "Runs the same query through Google's managed Vertex AI "
+                    "Search data store. Needs one-time GCP setup — "
+                    "instructions appear below if not configured yet."
+                ),
+            )
+        with cmp_b:
+            compare_gemini = st.checkbox(
+                "🆚 Gemini File Search",
+                value=False,
+                key="srch_compare_gemini",
+                help=(
+                    "Runs the same query via Gemini's built-in File Search RAG. "
+                    "Uses the same GOOGLE_API_KEY — no extra setup."
+                ),
+            )
 
         if q.strip():
             try:
@@ -430,6 +442,98 @@ with tab_search:
                                             key="vx_index_now"):
                                 with st.spinner("Pushing documents… (each takes a moment)"):
                                     rep = _vx.index_everything()
+                                if rep.get("needsSetup"):
+                                    st.error(rep.get("message", "Setup required."))
+                                else:
+                                    ea = rep.get("email_archive", {})
+                                    at = rep.get("attachment_extractions", {})
+                                    st.success(
+                                        f"Pushed: emails={ea.get('indexed', 0)} "
+                                        f"(errors={ea.get('errors', 0)}), "
+                                        f"attachments={at.get('indexed', 0)} "
+                                        f"(errors={at.get('errors', 0)})"
+                                    )
+                                    st.info(rep.get("note", ""))
+
+            # ── Gemini File Search side-by-side ────────────────────────
+            if compare_gemini:
+                st.divider()
+                st.markdown("### 🆚 Gemini File Search results")
+                st.caption(
+                    "Same query, Google's built-in File Search (managed RAG "
+                    "inside the Gemini API). Uses the same GOOGLE_API_KEY — "
+                    "no extra GCP setup."
+                )
+                try:
+                    from property_management_agent import _gemini_file_search as _gx
+                except Exception as e:
+                    st.error(f"Could not load Gemini File Search backend: {e}")
+                    _gx = None
+
+                if _gx is not None:
+                    with st.spinner("Querying Gemini File Search…"):
+                        g_result = _gx.search(q, limit=int(limit))
+                    if g_result.get("needsSetup"):
+                        st.warning("Gemini File Search not configured.")
+                        st.code(g_result.get("message", ""), language="text")
+                    elif g_result.get("isError"):
+                        st.error(g_result.get("message", "Gemini File Search failed."))
+                    else:
+                        g_answer = g_result.get("answer", "")
+                        g_hits = g_result.get("results", [])
+                        if g_answer:
+                            with st.container(border=True):
+                                st.markdown("**📝 Grounded answer**")
+                                st.write(g_answer)
+                        st.caption(f"**{len(g_hits)}** retrieved chunk(s).")
+                        if g_hits:
+                            g_df = pd.DataFrame(g_hits)
+                            g_show = [c for c in (
+                                "title", "snippet", "source", "web_view_link",
+                                "page_number", "doc_id",
+                            ) if c in g_df.columns]
+                            st.dataframe(
+                                g_df[g_show],
+                                use_container_width=True,
+                                hide_index=True,
+                                column_config={
+                                    "web_view_link": st.column_config.LinkColumn(
+                                        "Open", display_text="🔗"
+                                    ),
+                                    "snippet": st.column_config.TextColumn(
+                                        "snippet", width="large"
+                                    ),
+                                    "title": st.column_config.TextColumn(
+                                        "title", width="medium"
+                                    ),
+                                },
+                            )
+                        with st.expander(
+                            "⚙️ Gemini File Search status / push data",
+                            expanded=False,
+                        ):
+                            gs = _gx.get_status()
+                            if gs.get("available"):
+                                if gs.get("store_exists"):
+                                    st.success(
+                                        f"Store: {gs.get('display_name')} · "
+                                        f"active={gs.get('active_documents')}, "
+                                        f"pending={gs.get('pending_documents')}, "
+                                        f"failed={gs.get('failed_documents')}, "
+                                        f"size={gs.get('size_bytes')} B"
+                                    )
+                                else:
+                                    st.info(
+                                        "Store will be created on first index."
+                                    )
+                            else:
+                                st.warning(gs.get("reason", ""))
+                            if st.button(
+                                "⬆ Index now (push email_archive + attachments)",
+                                key="gx_index_now",
+                            ):
+                                with st.spinner("Pushing documents…"):
+                                    rep = _gx.index_everything()
                                 if rep.get("needsSetup"):
                                     st.error(rep.get("message", "Setup required."))
                                 else:
